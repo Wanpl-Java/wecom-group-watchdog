@@ -13,6 +13,8 @@ msgs.json
 sessions.json
 scan.json
 
-
 gui/.venv/
+gui/build/
+gui/dist/
+gui/*.spec
 

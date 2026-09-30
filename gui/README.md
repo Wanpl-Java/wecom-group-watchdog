@@ -8,7 +8,18 @@
 2. 立即扫描  
 3. 模拟话术问答（仅生成 / 生成并推飞书）  
 
-## 启动
+## 打包成 exe（推荐给同事直接用）
+
+先确保本机已装 Python，在 `gui/` 下执行：
+
+```powershell
+.\build_exe.bat
+```
+
+生成目录：`gui\dist\WatchdogConsole\WatchdogConsole.exe`  
+把整个 `WatchdogConsole` 文件夹拷走即可（需本机已启动 Watchdog 8092）。
+
+## 开发启动（源码）
 
 先启动仓库根目录的 Watchdog 服务（8092），再：
 
