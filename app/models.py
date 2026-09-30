@@ -34,6 +34,9 @@ class GroupConfig(BaseModel):
     room_id: str
     name: str = ""
     product: str = ""
+    # shanghai | other；空则按群名推断（含「上海」→ shanghai，否则 other）
+    region: str = ""
+    # 显式指定时优先；否则按 region + support_by_region 解析
     support_userids: List[str] = Field(default_factory=list)
     enabled: bool = True
 
@@ -42,6 +45,15 @@ class GroupsFile(BaseModel):
     groups: List[GroupConfig] = Field(default_factory=list)
     ignore_unknown_rooms: bool = True
     staff_userids: List[str] = Field(default_factory=list)
+    # 按区域默认值班企微 userid（应用消息推送对象）
+    # 例：shanghai → 小杭；other → 小东
+    support_by_region: dict = Field(
+        default_factory=lambda: {
+            "shanghai": ["jumpserver-1"],
+            "other": ["jumpserverDongQuJiShuZhiChi"],
+        }
+    )
+    default_region: str = "other"
 
 
 class UnansweredCase(BaseModel):
@@ -68,4 +80,5 @@ class ScanResult(BaseModel):
     alerted: int = 0
     skipped_cooldown: int = 0
     skipped_offhours: int = 0
+    skipped_no_followup: int = 0
     details: List[dict] = Field(default_factory=list)

@@ -1,29 +1,38 @@
 # 复制为 groups.yaml 后按真实客户群填写
 # room_id：企微客户群 chat_id（会话存档/外部群 ID）
-# support_userids：该群值班支持号（企微 userid），可多人，都会收到提醒
-# product：用于拼 MaxKB 提示（js / de / mk ...）
+# region：shanghai | other（可空；群名含「上海」会自动当成 shanghai）
+# support_userids：一般不用填；不填则按区域路由到小杭/小东
+# product：jumpserver / dataease / ...
+
+# 按区域默认推送对象（企微应用消息 touser）
+# 上海 → 技术支持小杭；其他 → 企业支持小东
+support_by_region:
+  shanghai:
+    - jumpserver-1
+  other:
+    - jumpserverDongQuJiShuZhiChi
+
+default_region: other
 
 groups:
-  - room_id: "wr_demo_jumpserver_01"
-    name: "【JS】示例客户支持群"
+  - room_id: "wr_demo_shanghai_01"
+    name: "【JS】上海某客户支持群"
     product: jumpserver
-    support_userids:
-      - zhangsan
+    region: shanghai
     enabled: true
 
-  - room_id: "wr_demo_dataease_01"
-    name: "【DE】示例客户支持群"
-    product: dataease
-    support_userids:
-      - lisi
+  - room_id: "wr_demo_beijing_01"
+    name: "【JS】北京某客户支持群"
+    product: jumpserver
+    region: other
     enabled: true
 
-# 未在上面登记的群：是否忽略（推荐 true，避免未知群乱提醒）
+# 未登记群是否忽略（推荐 true）
 ignore_unknown_rooms: true
 
-# 判定「内部同事」的 userid 前缀/名单（会话存档里 from 为企业成员）
-# 留空则：凡不在 external_* 形态、且在任一 support_userids 或 staff_userids 中的视为已回复
+# 判定「内部同事已回复」的企微 userid（含你自己 + 小东小杭）
+# WanPeiLin：存档/桥接视角，在所有群里；不算推送对象，但说话算已跟进
 staff_userids:
-  - zhangsan
-  - lisi
-  - wangwu
+  - WanPeiLin
+  - jumpserver-1
+  - jumpserverDongQuJiShuZhiChi

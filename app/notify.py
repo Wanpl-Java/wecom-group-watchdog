@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -230,6 +230,45 @@ def build_feishu_resolved_card(
                     ),
                 }
             ],
+        },
+    }
+
+
+def build_feishu_pending_list_card(
+    items: List[Dict[str, Any]],
+    *,
+    title: str = "待跟进清单",
+) -> dict:
+    """汇总当前所有未关闭的待跟进（一条卡片看全貌）。"""
+    if not items:
+        body_md = "当前没有待跟进项。"
+        template = "green"
+    else:
+        lines = [f"共 **{len(items)}** 条待跟进：\n"]
+        for i, it in enumerate(items[:30], 1):
+            g = _md_escape_lite(str(it.get("group_name") or it.get("room_id") or ""))
+            wait = it.get("waiting_minutes")
+            wait_s = f"{wait} 分钟" if wait is not None else "-"
+            preview = _md_escape_lite(str(it.get("preview") or ""))[:120]
+            lines.append(
+                f"{i}. **{g}** · 已等 {wait_s}\n"
+                f"   - 要点：{preview or '（无摘录）'}\n"
+                f"   - room：`{it.get('room_id')}`"
+            )
+        if len(items) > 30:
+            lines.append(f"\n…另有 {len(items) - 30} 条未列出")
+        body_md = "\n".join(lines)
+        template = "orange"
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title[:40]},
+            "template": template,
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [{"tag": "markdown", "content": body_md[:3500]}],
         },
     }
 

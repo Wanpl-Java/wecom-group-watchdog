@@ -24,6 +24,78 @@ def is_js_room_name(name: str) -> bool:
     )
 
 
+# 客户纯确认/应答：不应再当成「待跟进」
+_ACK_EXACT = {
+    "收到",
+    "收到了",
+    "好的",
+    "好的谢谢",
+    "好的，谢谢",
+    "好的谢谢！",
+    "谢谢",
+    "谢谢！",
+    "谢谢老师",
+    "谢谢老师！",
+    "感谢",
+    "ok",
+    "okay",
+    "ok谢谢",
+    "嗯",
+    "嗯嗯",
+    "嗯嗯好的",
+    "好",
+    "好的哈",
+    "明白",
+    "了解",
+    "知道了",
+    "已收到",
+    "已阅",
+    "1",
+    "好滴",
+    "收到谢谢",
+    "收到，谢谢",
+}
+
+
+def is_customer_ack(content: str) -> bool:
+    """客户短确认语（如「收到」）不算待跟进。"""
+    raw = (content or "").strip()
+    if not raw:
+        return True
+    # 去掉常见标点再比
+    compact = (
+        raw.replace(" ", "")
+        .replace("　", "")
+        .replace("!", "")
+        .replace("！", "")
+        .replace("。", "")
+        .replace(".", "")
+        .replace("~", "")
+        .replace("～", "")
+    )
+    low = compact.lower()
+    if low in {x.lower() for x in _ACK_EXACT}:
+        return True
+    # 极短且仅确认语义
+    if len(compact) <= 8 and any(
+        compact.startswith(p) or compact == p
+        for p in ("收到", "好的", "谢谢", "感谢", "明白", "了解", "嗯")
+    ):
+        # 含问号/求助则不算确认
+        if any(x in raw for x in ("?", "？", "怎么", "如何", "吗", "呢", "失败", "报错", "不行")):
+            return False
+        return True
+    return False
+
+
+def _staff_before_customer(recent: list, customer_at: float) -> bool:
+    """这条客户消息之前是否刚有同事发言（典型：发完方案客户回「收到」）。"""
+    return any(
+        m.sender_kind == SenderKind.staff and float(m.sent_at) <= float(customer_at)
+        for m in recent
+    )
+
+
 def is_de_room_name(name: str) -> bool:
     n = name or ""
     u = n.upper()
@@ -101,12 +173,12 @@ def find_unanswered(
         if group is None:
             if registry.file.ignore_unknown_rooms:
                 continue
-            # 未登记群：仍扫描，提醒走飞书；企微应用推送用 staff_userids
+            # 未登记群：仍扫描；推送对象按群名区域规则解析
             group = GroupConfig(
                 room_id=room_id,
                 name="",
                 product="",
-                support_userids=default_support,
+                support_userids=[],
                 enabled=True,
             )
         if not group.enabled:
@@ -136,6 +208,14 @@ def find_unanswered(
             continue
         if last_staff_after_customer:
             continue
+        # 「收到 / 好的 / ok」等确认语：尤其是同事刚发完方案后，不算待跟进
+        if is_customer_ack(last_customer.content) and _staff_before_customer(
+            recent, last_customer.sent_at
+        ):
+            continue
+        # 纯确认且极短，即使前面没抓到 staff，也不告警（避免误报）
+        if is_customer_ack(last_customer.content) and len((last_customer.content or "").strip()) <= 10:
+            continue
 
         waiting = now_ts - float(last_customer.sent_at)
         if waiting < threshold:
@@ -147,7 +227,7 @@ def find_unanswered(
             role = m.sender_kind.value
             excerpt_lines.append(f"[{role}] {who}: {m.content[:200]}")
 
-        support = list(group.support_userids) or default_support
+        support = registry.resolve_support_userids(group, room_name) or default_support
         product = group.product or (
             "jumpserver" if is_js_room_name(room_name) else ("dataease" if is_de_room_name(room_name) else "")
         )

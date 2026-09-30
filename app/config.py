@@ -77,6 +77,8 @@ class Settings(BaseSettings):
     ai_gateway_base_url: str = ""
     ai_gateway_api_key: str = ""
     ai_gateway_model: str = "f2c-auto"
+    # 超时候选告警前，用 AI 再判一次是否真需跟进（收到/致谢等会跳过）
+    followup_ai_judge: bool = True
 
     ingest_token: str = ""
 

@@ -236,6 +236,31 @@ async def set_scan_interval(
     return {"ok": True, "scan_interval_minutes": minutes}
 
 
+@app.get("/admin/pending")
+async def admin_pending(
+    store: MessageStore = Depends(get_store),
+    registry: GroupRegistry = Depends(get_registry),
+) -> Dict[str, Any]:
+    """当前待跟进清单（未关闭、同事尚未回复）。"""
+    from .pipeline import collect_pending_items
+
+    items = collect_pending_items(store, registry)
+    return {"ok": True, "count": len(items), "items": items}
+
+
+@app.post("/admin/pending-digest")
+async def admin_pending_digest(
+    force: bool = Query(True, description="空清单也推送一张「当前无待跟进」"),
+    settings: Settings = Depends(get_settings),
+    store: MessageStore = Depends(get_store),
+    registry: GroupRegistry = Depends(get_registry),
+) -> Dict[str, Any]:
+    """手动把待跟进清单推到飞书。"""
+    from .pipeline import push_pending_digest
+
+    return await push_pending_digest(store, registry, settings, force=force)
+
+
 @app.post("/admin/suggest")
 async def admin_suggest(
     body: Dict[str, Any],

@@ -2,13 +2,29 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import yaml
 
 from .models import GroupConfig, GroupsFile
 
 logger = logging.getLogger(__name__)
+
+_SHANGHAI_MARKERS = ("上海", "Shanghai", "SHANGHAI", "沪")
+
+
+def infer_region(name: str, explicit: str = "", default_region: str = "other") -> str:
+    raw = (explicit or "").strip().lower()
+    if raw in ("shanghai", "sh", "沪", "上海"):
+        return "shanghai"
+    if raw in ("other", "default", "其他", "其它"):
+        return "other"
+    if raw:
+        return raw
+    n = name or ""
+    if any(m in n for m in _SHANGHAI_MARKERS):
+        return "shanghai"
+    return (default_region or "other").strip().lower() or "other"
 
 
 class GroupRegistry:
@@ -39,9 +55,40 @@ class GroupRegistry:
         ids: Set[str] = set(self.file.staff_userids or [])
         for g in self.file.groups:
             ids.update(g.support_userids or [])
+        for users in (self.file.support_by_region or {}).values():
+            if isinstance(users, list):
+                ids.update(str(u) for u in users if u)
         return ids
 
     def is_staff(self, sender_id: str) -> bool:
         if not sender_id:
             return False
         return sender_id in self.staff_ids()
+
+    def resolve_support_userids(
+        self,
+        group: Optional[GroupConfig],
+        room_name: str = "",
+    ) -> List[str]:
+        """
+        企微应用消息推送对象：
+        1) 群配置显式 support_userids
+        2) 否则按 region / 群名推断 → support_by_region
+        3) 再否则 staff_userids
+        """
+        if group and group.support_userids:
+            return [u for u in group.support_userids if u]
+        name = (group.name if group else "") or room_name or ""
+        region = infer_region(
+            name,
+            explicit=(group.region if group else ""),
+            default_region=self.file.default_region or "other",
+        )
+        by_region = self.file.support_by_region or {}
+        users = by_region.get(region) or by_region.get("other") or []
+        if isinstance(users, str):
+            users = [users]
+        out = [str(u) for u in users if u]
+        if out:
+            return out
+        return [u for u in (self.file.staff_userids or []) if u]
