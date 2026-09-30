@@ -1,0 +1,47 @@
+# JumpServer 飞致云知识库「具体文章」索引
+# 分类站：https://kb.fit2cloud.com/categories/jumpserver （仅兜底；回复须优先给本文件命中的文章直链）
+
+articles:
+  - title: "【V3】JumpServer 远程应用发布机的配置步骤"
+    url: "https://kb.fit2cloud.com/?p=9beffa46-3b58-456b-9db0-7a0b2a9cc665"
+    keywords: [远程应用发布机, 应用发布机, 发布机部署, 发布机怎么部署, 配置发布机, 远程应用部署, 初始化部署, RemoteApp部署, 部署发布机]
+
+  - title: "应用发布机问题处理汇总"
+    url: "https://kb.fit2cloud.com/?p=4f20735b-be16-43c9-ab79-7628193b62d9"
+    keywords: [发布机问题, 发布机报错, Wait Tinker, Tinker api health, Tinker离线, Tinker注册, rc:5, 发布机故障]
+
+  - title: "【V2】Remote APP 配置方式【免域配置】"
+    url: "https://kb.fit2cloud.com/?p=235"
+    keywords: [Remote APP, 免域, jmservisor, V2远程应用]
+
+  - title: "【V3/V4】JumpServer登陆提示设置配置项 DOMAINS"
+    url: "https://kb.fit2cloud.com/?p=019ba1c6-d4d3-7082-a2a2-d13ef3ab0a9b"
+    keywords: [DOMAINS, 可信任域名, 配置文件有问题，无法登录, 无法登录请联系管理员]
+
+  - title: "【V4】JumpServer v4 升级指南"
+    url: "https://kb.fit2cloud.com/?p=7a145bad-b9e6-41ae-aa80-33cd095a91ec"
+    keywords: [v4升级, 升级到v4, 升级到4, 4.0升级]
+
+  - title: "JumpServer v4.0 升级指南"
+    url: "https://kb.fit2cloud.com/?p=b72fbd70-d578-4256-a21b-ba5b4b1a4f63"
+    keywords: [v4.0升级, 升级v4.0]
+
+  - title: "JumpServer V4 版本相关问题解答"
+    url: "https://kb.fit2cloud.com/?p=9048a95a-fc14-4284-bfaf-afe4bbee168f"
+    keywords: [V4问题, V4问答, v4相关问题]
+
+  - title: "JumpServer 如何回退版本？"
+    url: "https://kb.fit2cloud.com/?p=c49b0099-c933-4af4-b7e3-445c89397284"
+    keywords: [回退版本, 版本回退, 降级, 回滚版本]
+
+  - title: "JumpServer 升级问题"
+    url: "https://kb.fit2cloud.com/?p=be4ce6f1-e9a0-45fe-8f59-d36258e409e2"
+    keywords: [升级报错, upgrade报错, restore_db, 升级问题]
+
+  - title: "【V3】JumpServer 组件相关的常见问题"
+    url: "https://kb.fit2cloud.com/?p=288bcfe2-c7f6-4954-984c-55c115b524e9"
+    keywords: [组件问题, 组件离线, Server error occur, 账号被锁定, LDAP无法登录]
+
+  - title: "通过 SSL 证书访问 JumpServer 的配置方案"
+    url: "https://kb.fit2cloud.com/?p=98f1d391-fb98-4651-8051-9083a48934cf"
+    keywords: [SSL证书, HTTPS证书, 替换证书, 配置HTTPS]

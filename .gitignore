@@ -1,0 +1,15 @@
+data/
+.env
+config/groups.yaml
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+
+.tmp/
+_sim_*.txt
+msgs.json
+sessions.json
+scan.json
+

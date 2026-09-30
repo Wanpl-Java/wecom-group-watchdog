@@ -1,0 +1,15 @@
+services:
+  wecom-group-watchdog:
+    build: .
+    container_name: wecom-group-watchdog
+    ports:
+      - "8092:8092"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      GROUPS_CONFIG: /app/config/groups.yaml
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    restart: unless-stopped

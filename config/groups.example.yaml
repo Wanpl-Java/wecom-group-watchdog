@@ -1,0 +1,29 @@
+# 复制为 groups.yaml 后按真实客户群填写
+# room_id：企微客户群 chat_id（会话存档/外部群 ID）
+# support_userids：该群值班支持号（企微 userid），可多人，都会收到提醒
+# product：用于拼 MaxKB 提示（js / de / mk ...）
+
+groups:
+  - room_id: "wr_demo_jumpserver_01"
+    name: "【JS】示例客户支持群"
+    product: jumpserver
+    support_userids:
+      - zhangsan
+    enabled: true
+
+  - room_id: "wr_demo_dataease_01"
+    name: "【DE】示例客户支持群"
+    product: dataease
+    support_userids:
+      - lisi
+    enabled: true
+
+# 未在上面登记的群：是否忽略（推荐 true，避免未知群乱提醒）
+ignore_unknown_rooms: true
+
+# 判定「内部同事」的 userid 前缀/名单（会话存档里 from 为企业成员）
+# 留空则：凡不在 external_* 形态、且在任一 support_userids 或 staff_userids 中的视为已回复
+staff_userids:
+  - zhangsan
+  - lisi
+  - wangwu
