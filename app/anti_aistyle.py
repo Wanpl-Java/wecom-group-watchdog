@@ -166,6 +166,20 @@ def _trim_solicitation_tail(sec4: str, customer_excerpt: str) -> str:
     return text or sec4.strip()
 
 
+def _normalize_reply_voice(sec4: str) -> str:
+    """统一第4段开场口吻，避免老师您好/好的老师等来回切换。"""
+    text = (sec4 or "").strip()
+    if not text:
+        return text
+    # 常见开场归一到「老师好，」
+    text = re.sub(r"^(好的老师|老师您好|您好老师|亲爱的老师)[，,：:\s]*", "老师好，", text)
+    if not text.startswith("老师好"):
+        text = "老师好，" + text.lstrip("，,：: ")
+    elif text.startswith("老师好") and not text.startswith("老师好，"):
+        text = "老师好，" + text[len("老师好") :].lstrip("，,：: ")
+    return text
+
+
 def light_deai_customer_reply(suggestion: str, customer_excerpt: str = "") -> str:
     """确定性轻清理：去套话；第4段去 AI 符、压短，并按原问裁掉多余追问。"""
     if not suggestion:
@@ -205,4 +219,5 @@ def light_deai_customer_reply(suggestion: str, customer_excerpt: str = "") -> st
     else:
         sec4 = "\n".join(bullet_lines)
     sec4 = _trim_solicitation_tail(sec4, customer_excerpt)
+    sec4 = _normalize_reply_voice(sec4)
     return f"{head.rstrip()}\n{sec4}\n"

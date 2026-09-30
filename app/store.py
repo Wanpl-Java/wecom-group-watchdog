@@ -110,6 +110,33 @@ class MessageStore:
         alerts[key] = float(ts if ts is not None else time.time())
         self._save_state(data)
 
+    def set_open_alert(self, key: str, meta: Dict[str, Any]) -> None:
+        data = self._load_state()
+        opens = data.setdefault("open_alerts", {})
+        opens[key] = {
+            **(meta or {}),
+            "alerted_at": float(meta.get("alerted_at") or time.time()),
+            "resolved_notified": False,
+        }
+        self._save_state(data)
+
+    def list_open_alerts(self) -> Dict[str, Dict[str, Any]]:
+        data = self._load_state()
+        raw = data.get("open_alerts") or {}
+        return {k: dict(v) for k, v in raw.items() if isinstance(v, dict)}
+
+    def mark_alert_resolved_notified(self, key: str) -> None:
+        data = self._load_state()
+        opens = data.setdefault("open_alerts", {})
+        item = opens.get(key)
+        if not item:
+            return
+        item["resolved_notified"] = True
+        item["resolved_at"] = time.time()
+        # 保留最近记录即可，已通知后可删
+        opens.pop(key, None)
+        self._save_state(data)
+
     def _load_state(self) -> Dict[str, Any]:
         with self._lock:
             try:

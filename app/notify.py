@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -110,6 +111,170 @@ async def send_feishu_text(webhook: str, content: str, safe_mode: bool) -> Optio
     except Exception:  # noqa: BLE001
         logger.exception("feishu notify webhook failed")
         return {"error": True}
+
+
+def parse_suggestion_sections(suggestion: str) -> Dict[str, str]:
+    """拆四段输出，供飞书卡片分区展示。"""
+    text = (suggestion or "").strip()
+    sections = {"type": "", "content": "", "analysis": "", "reply": ""}
+    if not text:
+        return sections
+    patterns = [
+        ("type", r"1\)\s*问题类型与紧急程度"),
+        ("content", r"2\)\s*问题内容"),
+        ("analysis", r"3\)\s*问题分析"),
+        ("reply", r"4\)\s*回复建议"),
+    ]
+    matches = []
+    for key, pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            matches.append((m.start(), key, m.end()))
+    matches.sort()
+    for i, (start, key, end) in enumerate(matches):
+        stop = matches[i + 1][0] if i + 1 < len(matches) else len(text)
+        body = text[end:stop].strip()
+        sections[key] = body
+    if not sections["reply"] and text:
+        sections["reply"] = text
+    return sections
+
+
+def _md_escape_lite(s: str) -> str:
+    return (s or "").replace("\r\n", "\n").strip()
+
+
+def build_feishu_alert_card(
+    *,
+    group_name: str,
+    room_id: str,
+    waiting_minutes: float,
+    excerpt: str,
+    suggestion: str,
+    source: str,
+    prefix: str = "",
+) -> dict:
+    """飞书 interactive 卡片：分区展示，突出可复制回复。"""
+    secs = parse_suggestion_sections(suggestion)
+    reply = _md_escape_lite(secs.get("reply") or suggestion)[:1200]
+    analysis = _md_escape_lite(secs.get("analysis") or "")[:800]
+    qtype = _md_escape_lite(secs.get("type") or "")[:200]
+    excerpt_s = _md_escape_lite(excerpt)[:600]
+    title = "客户群待跟进"
+    if prefix:
+        title = f"{prefix.strip()} {title}".strip()
+
+    elements: List[dict] = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**群**：{group_name}\n"
+                f"**等待**：{waiting_minutes} 分钟未内部回复\n"
+                f"**来源**：{source}\n"
+                f"**room**：`{room_id}`"
+            ),
+        },
+        {"tag": "hr"},
+        {
+            "tag": "markdown",
+            "content": f"**客户原话**\n{excerpt_s or '（无）'}",
+        },
+    ]
+    if qtype:
+        elements.append({"tag": "markdown", "content": f"**类型**\n{qtype}"})
+    if analysis:
+        elements.append({"tag": "markdown", "content": f"**内部分析**\n{analysis}"})
+    elements.extend(
+        [
+            {"tag": "hr"},
+            {
+                "tag": "markdown",
+                "content": f"**可复制回复**\n{reply or '（暂无）'}",
+            },
+        ]
+    )
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title[:40]},
+            "template": "orange",
+        },
+        "body": {"direction": "vertical", "elements": elements},
+    }
+
+
+def build_feishu_resolved_card(
+    *,
+    group_name: str,
+    room_id: str,
+    note: str = "同事已在群内回复，本条可关闭。",
+) -> dict:
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "客户群已跟进"},
+            "template": "green",
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**群**：{group_name}\n"
+                        f"**room**：`{room_id}`\n"
+                        f"**状态**：已回复\n"
+                        f"{note}"
+                    ),
+                }
+            ],
+        },
+    }
+
+
+async def send_feishu_card(webhook: str, card: dict, safe_mode: bool) -> Optional[dict]:
+    """飞书自定义机器人：消息卡片（比纯文本更规范）。"""
+    if not webhook:
+        return None
+    if safe_mode:
+        logger.info("[SAFE_MODE] would post feishu card: %s", str(card)[:400])
+        return {"safe_mode": True, "card": True}
+    payload = {"msg_type": "interactive", "card": card}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(webhook, json=payload)
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {"ok": True}
+            code = None
+            if isinstance(data, dict):
+                code = data.get("code", data.get("StatusCode", 0))
+            if code not in (0, None, "0"):
+                logger.error("feishu card webhook failed: %s", data)
+                # 卡片失败时降级纯文本，避免完全丢通知
+                fallback = _card_to_plain(card)
+                return await send_feishu_text(webhook, fallback, safe_mode=False)
+            return data
+    except Exception:  # noqa: BLE001
+        logger.exception("feishu card webhook failed")
+        try:
+            return await send_feishu_text(webhook, _card_to_plain(card), safe_mode=False)
+        except Exception:  # noqa: BLE001
+            return {"error": True}
+
+
+def _card_to_plain(card: dict) -> str:
+    title = ""
+    try:
+        title = card.get("header", {}).get("title", {}).get("content", "") or ""
+    except Exception:  # noqa: BLE001
+        title = ""
+    parts = [title] if title else []
+    for el in (card.get("body") or {}).get("elements") or []:
+        if el.get("tag") == "markdown" and el.get("content"):
+            parts.append(str(el["content"]))
+    return "\n\n".join(parts)[:3900]
 
 
 async def send_generic_webhook(

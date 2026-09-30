@@ -249,7 +249,7 @@ async def admin_suggest(
     import time as _time
 
     from .models import IngestMessage, SenderKind, UnansweredCase
-    from .notify import format_alert_markdown, send_feishu_text
+    from .notify import build_feishu_alert_card, send_feishu_card
     from .workbuddy import suggest_reply
 
     excerpt = str(body.get("question") or body.get("customer_excerpt") or "").strip()
@@ -301,20 +301,19 @@ async def admin_suggest(
             out["ok"] = False
             out["error"] = "FEISHU_NOTIFY_WEBHOOK 未配置"
             return out
-        md = format_alert_markdown(
+        card = build_feishu_alert_card(
             group_name=group_name,
             room_id=room_id,
             waiting_minutes=waiting,
             excerpt=excerpt,
             suggestion=result.suggestion,
             source=f"{result.source}+gui",
+            prefix="【GUI模拟】",
         )
-        # 模拟推送标题加前缀，方便飞书里区分正式告警
-        md = "【GUI 模拟推送】\n" + md
         use_safe = settings.safe_mode and not force_real
-        feishu_resp = await send_feishu_text(
+        feishu_resp = await send_feishu_card(
             settings.feishu_notify_webhook,
-            md,
+            card,
             safe_mode=use_safe,
         )
         out["feishu_resp"] = feishu_resp
@@ -336,7 +335,7 @@ async def admin_feishu_push(
     settings: Settings = Depends(get_settings),
 ) -> Dict[str, Any]:
     """把已有建议文本推到飞书（GUI「推送上次结果」）。"""
-    from .notify import format_alert_markdown, send_feishu_text
+    from .notify import build_feishu_alert_card, send_feishu_card
 
     suggestion = str(body.get("suggestion") or "").strip()
     excerpt = str(body.get("question") or body.get("excerpt") or "").strip()
@@ -349,19 +348,19 @@ async def admin_feishu_push(
     force_real = bool(body.get("force_real"))
     if not (settings.feishu_notify_webhook or "").strip():
         return {"ok": False, "error": "FEISHU_NOTIFY_WEBHOOK 未配置"}
-    md = format_alert_markdown(
+    card = build_feishu_alert_card(
         group_name=group_name,
         room_id=room_id,
         waiting_minutes=waiting,
         excerpt=excerpt or suggestion[:200],
         suggestion=suggestion,
         source=source,
+        prefix="【GUI模拟】",
     )
-    md = "【GUI 模拟推送】\n" + md
     use_safe = settings.safe_mode and not force_real
-    feishu_resp = await send_feishu_text(
+    feishu_resp = await send_feishu_card(
         settings.feishu_notify_webhook,
-        md,
+        card,
         safe_mode=use_safe,
     )
     pushed = bool(feishu_resp) and not (
