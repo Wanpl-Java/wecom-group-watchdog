@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import html
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .config import Settings, get_settings
 from .crypto import WeComCryptoError, maybe_crypto
@@ -54,6 +56,9 @@ async def lifespan(app: FastAPI):
         n = _store.upsert_messages(msgs)
         logger.info("demo seed inserted/kept %s messages", n)
 
+    if not scheduler.running:
+        scheduler.start()
+
     if settings.scan_interval_minutes > 0:
         scheduler.add_job(
             _scheduled_scan,
@@ -63,8 +68,22 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             max_instances=1,
         )
-        scheduler.start()
-        logger.info("scheduler started: every %s minutes", settings.scan_interval_minutes)
+        logger.info("scheduler scan: every %s minutes", settings.scan_interval_minutes)
+
+    if settings.digest_interval_minutes > 0:
+        scheduler.add_job(
+            _scheduled_digest,
+            "interval",
+            minutes=settings.digest_interval_minutes,
+            id="pending_digest",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info(
+            "scheduler digest: every %s minutes (public_base=%s)",
+            settings.digest_interval_minutes,
+            (settings.public_base_url or f"http://127.0.0.1:{settings.app_port}"),
+        )
 
     logger.info(
         "wecom-group-watchdog up safe_mode=%s workbuddy_mode=%s source=%s",
@@ -87,6 +106,19 @@ async def _scheduled_scan() -> None:
         logger.info("scheduled scan: %s", result.model_dump())
     except Exception:  # noqa: BLE001
         logger.exception("scheduled scan failed")
+
+
+async def _scheduled_digest() -> None:
+    settings = get_settings()
+    try:
+        from .pipeline import push_pending_digest
+
+        result = await push_pending_digest(
+            get_store(), get_registry(), settings, force=False
+        )
+        logger.info("scheduled digest: %s", {k: result.get(k) for k in ("ok", "count", "skipped", "error")})
+    except Exception:  # noqa: BLE001
+        logger.exception("scheduled digest failed")
 
 
 def _check_ingest_token(
@@ -117,6 +149,14 @@ async def healthz() -> Dict[str, Any]:
         "message_source": settings.message_source,
         "scan_interval_minutes": interval,
         "unanswered_minutes": settings.unanswered_minutes,
+        "notify_channel": "wecom_webhook",
+        "wecom_webhook_configured": bool((settings.wecom_notify_webhook or "").strip()),
+        "feishu_webhook_configured": bool((settings.feishu_notify_webhook or "").strip()),
+        "digest_interval_minutes": settings.digest_interval_minutes,
+        "digest_sync_before_send": settings.digest_sync_before_send,
+        "confluence_configured": bool((settings.confluence_token or "").strip()),
+        "public_base_url": (settings.public_base_url or "").strip()
+        or f"http://127.0.0.1:{settings.app_port}",
     }
 
 
@@ -238,13 +278,14 @@ async def set_scan_interval(
 
 @app.get("/admin/pending")
 async def admin_pending(
+    settings: Settings = Depends(get_settings),
     store: MessageStore = Depends(get_store),
     registry: GroupRegistry = Depends(get_registry),
 ) -> Dict[str, Any]:
     """当前待跟进清单（未关闭、同事尚未回复）。"""
     from .pipeline import collect_pending_items
 
-    items = collect_pending_items(store, registry)
+    items = collect_pending_items(store, registry, settings=settings)
     return {"ok": True, "count": len(items), "items": items}
 
 
@@ -255,10 +296,282 @@ async def admin_pending_digest(
     store: MessageStore = Depends(get_store),
     registry: GroupRegistry = Depends(get_registry),
 ) -> Dict[str, Any]:
-    """手动把待跟进清单推到飞书。"""
+    """手动把未回复客户表推到企微（带详情超链接）。"""
     from .pipeline import push_pending_digest
 
     return await push_pending_digest(store, registry, settings, force=force)
+
+
+def _render_case_html(
+    meta: Dict[str, Any],
+    *,
+    waiting: Optional[float],
+    tip: str = "",
+) -> str:
+    """详情页视觉对齐企微 markdown：分区彩色标题 + 可复制回复高亮块。"""
+    from .notify import parse_suggestion_sections
+
+    group = html.escape(str(meta.get("group_name") or ""))
+    room = html.escape(str(meta.get("room_id") or ""))
+    source = html.escape(str(meta.get("source") or "-"))
+    wait_s = html.escape(str(waiting if waiting is not None else "-"))
+    excerpt = html.escape(str(meta.get("excerpt") or meta.get("preview") or "（无）"))
+    suggestion_raw = str(meta.get("suggestion") or "").strip()
+    secs = parse_suggestion_sections(suggestion_raw)
+    reply = (secs.get("reply") or suggestion_raw or "（暂无回复建议）").strip()
+    qtype = (secs.get("type") or "").strip()
+    analysis = (secs.get("analysis") or "").strip()
+    content = (secs.get("content") or "").strip()
+    token = html.escape(str(meta.get("detail_token") or ""))
+    tip_html = f'<div class="tip">{html.escape(tip)}</div>' if tip else ""
+
+    def _sec(
+        title_class: str,
+        title: str,
+        body: str,
+        *,
+        quote: bool = False,
+        is_reply: bool = False,
+    ) -> str:
+        if not (body or "").strip():
+            return ""
+        body_esc = html.escape(body.strip())
+        box_cls = "reply-box" if is_reply else ("quote" if quote else "body")
+        id_attr = ' id="replyText"' if is_reply else ""
+        return (
+            f'<div class="sec">'
+            f'<div class="htag {title_class}">【{html.escape(title)}】</div>'
+            f'<div class="{box_cls}"{id_attr}>{body_esc}</div>'
+            f"</div>"
+        )
+
+    type_block = ""
+    if qtype or content:
+        type_body = qtype
+        if content and content not in type_body:
+            type_body = (type_body + "\n" + content).strip() if type_body else content
+        type_block = _sec("c-info", "问题类型", type_body)
+
+    sections_html = "".join(
+        [
+            _sec("c-info", "客户原话", excerpt, quote=True),
+            type_block,
+            _sec("c-info", "内部分析", analysis),
+            _sec("c-warn", "可复制回复", reply, is_reply=True),
+        ]
+    )
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>待跟进 · {group}</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; min-height: 100vh; padding: 24px 14px 40px;
+      font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+      background: #f3f4f6; color: #1f2937; line-height: 1.65;
+    }}
+    .wrap {{ max-width: 680px; margin: 0 auto; }}
+    .bubble {{
+      background: #fff; border-radius: 12px; padding: 20px 22px 18px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.06); border: 1px solid #e5e7eb;
+    }}
+    .title {{
+      margin: 0 0 14px; font-size: 20px; font-weight: 700; color: #d97706;
+    }}
+    .meta {{ font-size: 14px; color: #4b5563; margin-bottom: 18px; }}
+    .meta .row {{ margin: 4px 0; }}
+    .meta .warn {{ color: #d97706; font-weight: 600; }}
+    .meta code {{
+      background: #fee2e2; color: #b91c1c; padding: 1px 6px; border-radius: 4px;
+      font-size: 13px;
+    }}
+    .sec {{ margin-top: 16px; }}
+    .htag {{ font-size: 15px; font-weight: 700; margin-bottom: 8px; }}
+    .htag.c-info {{ color: #059669; }}
+    .htag.c-warn {{ color: #d97706; }}
+    .quote {{
+      border-left: 3px solid #d1d5db; padding: 2px 0 2px 12px;
+      color: #374151; white-space: pre-wrap; word-break: break-word; font-size: 15px;
+    }}
+    .body {{
+      color: #374151; white-space: pre-wrap; word-break: break-word; font-size: 14px;
+    }}
+    .reply-box {{
+      background: #fee2e2; color: #b91c1c; border-radius: 8px;
+      padding: 12px 14px; white-space: pre-wrap; word-break: break-word;
+      font-size: 15px; font-weight: 500; line-height: 1.7;
+    }}
+    .actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }}
+    button {{
+      appearance: none; border: 0; border-radius: 10px; padding: 10px 16px;
+      font-size: 14px; font-weight: 600; cursor: pointer;
+    }}
+    .primary {{ background: #2563eb; color: #fff; }}
+    .secondary {{ background: #fff; color: #1f2937; border: 1px solid #d1d5db; }}
+    .tip {{
+      margin-bottom: 12px; padding: 10px 12px; border-radius: 10px;
+      background: #ecfdf5; color: #047857; font-size: 14px; border: 1px solid #a7f3d0;
+    }}
+    .ok {{ color: #059669; font-size: 13px; align-self: center; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    {tip_html}
+    <div class="bubble">
+      <h1 class="title">客户群待跟进提醒</h1>
+      <div class="meta">
+        <div class="row">群：<span class="warn">{group}</span></div>
+        <div class="row">room：<code>{room}</code></div>
+        <div class="row">已等待：<code>{wait_s}</code> 分钟 · 来源 <code>{source}</code></div>
+      </div>
+      {sections_html}
+      <div class="actions">
+        <button class="secondary" type="button" id="copyBtn" onclick="copyReply()">复制回复</button>
+        <span class="ok" id="copied"></span>
+      </div>
+    </div>
+  </div>
+  <script>
+    function copyReply() {{
+      const el = document.getElementById('replyText');
+      const tip = document.getElementById('copied');
+      if (!el) return;
+      const text = el.innerText || '';
+      function ok() {{
+        tip.textContent = '已复制';
+        tip.style.color = '#059669';
+        setTimeout(() => {{ tip.textContent = ''; }}, 2000);
+      }}
+      function fail(msg) {{
+        tip.textContent = msg || '复制失败，请手动选中粉色区域复制';
+        tip.style.color = '#b91c1c';
+      }}
+      // http://局域网IP 下 clipboard API 常被禁用，优先用 textarea 回退
+      try {{
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        const done = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (done) {{ ok(); return; }}
+      }} catch (e) {{}}
+      if (navigator.clipboard && window.isSecureContext) {{
+        navigator.clipboard.writeText(text).then(ok).catch(() => fail());
+      }} else {{
+        fail();
+      }}
+    }}
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/case/{token}", response_class=HTMLResponse)
+async def case_detail(
+    token: str,
+    settings: Settings = Depends(get_settings),
+    store: MessageStore = Depends(get_store),
+    registry: GroupRegistry = Depends(get_registry),
+) -> HTMLResponse:
+    """企微未回复表超链接：打开查看完整建议话术。"""
+    from .models import SenderKind, UnansweredCase
+    from .workbuddy import suggest_reply
+
+    meta = store.get_open_alert_by_token(token)
+    if not meta:
+        raise HTTPException(status_code=404, detail="案件不存在或已关闭（同事已回复）")
+    last_customer_at = float(meta.get("last_customer_at") or 0)
+    waiting = round(max(0.0, (time.time() - last_customer_at) / 60.0), 1) if last_customer_at else None
+    excerpt = str(meta.get("excerpt") or meta.get("preview") or "")
+    suggestion = str(meta.get("suggestion") or "").strip()
+    source = str(meta.get("source") or "stored")
+
+    # 旧告警未落库完整建议时，打开链接再生成一次并写回
+    if not suggestion:
+        room_id = str(meta.get("room_id") or "")
+        recent = annotate_messages(store.recent_messages(room_id, limit=20), registry)
+        if not excerpt:
+            for m in reversed(recent):
+                if m.sender_kind == SenderKind.customer:
+                    excerpt = (m.content or "").strip()
+                    break
+        g = registry.get(room_id)
+        room_name = str(meta.get("group_name") or (g.name if g else room_id))
+        case = UnansweredCase(
+            room_id=room_id,
+            group_name=room_name,
+            product=(g.product if g else "js"),
+            support_userids=registry.resolve_support_userids(g, room_name) if g else [],
+            last_customer_msg_id=str(meta.get("last_customer_msg_id") or ""),
+            last_customer_at=last_customer_at or time.time(),
+            waiting_minutes=float(waiting or 0),
+            recent_messages=recent,
+            customer_excerpt=excerpt,
+        )
+        result = await suggest_reply(case, settings)
+        suggestion = result.suggestion
+        source = result.source
+        key = str(meta.get("key") or "")
+        if key:
+            store.set_open_alert(
+                key,
+                {
+                    **meta,
+                    "excerpt": excerpt,
+                    "suggestion": suggestion,
+                    "source": source,
+                    "preview": (excerpt or "")[:100],
+                },
+            )
+            meta = store.get_open_alert_by_token(token) or meta
+
+    meta = {**meta, "excerpt": excerpt, "suggestion": suggestion, "source": source}
+    return HTMLResponse(_render_case_html(meta, waiting=waiting))
+
+
+@app.post("/case/{token}/push")
+async def case_push_wecom(
+    token: str,
+    settings: Settings = Depends(get_settings),
+    store: MessageStore = Depends(get_store),
+) -> HTMLResponse:
+    """详情页按钮：把该案完整建议再推到企微。"""
+    from .notify import (
+        format_alert_markdown,
+        primary_wecom_webhook,
+        send_webhook_markdown,
+    )
+
+    meta = store.get_open_alert_by_token(token)
+    if not meta:
+        raise HTTPException(status_code=404, detail="案件不存在或已关闭")
+    hook = primary_wecom_webhook(settings)
+    if not hook:
+        raise HTTPException(status_code=400, detail="WECOM_NOTIFY_WEBHOOK 未配置")
+    last_customer_at = float(meta.get("last_customer_at") or 0)
+    waiting = round(max(0.0, (time.time() - last_customer_at) / 60.0), 1) if last_customer_at else 0.0
+    md = format_alert_markdown(
+        group_name=str(meta.get("group_name") or ""),
+        room_id=str(meta.get("room_id") or ""),
+        waiting_minutes=float(waiting),
+        excerpt=str(meta.get("excerpt") or meta.get("preview") or ""),
+        suggestion=str(meta.get("suggestion") or "（暂无完整建议）"),
+        source=str(meta.get("source") or "stored"),
+    )
+    resp = await send_webhook_markdown(hook, md, safe_mode=settings.safe_mode)
+    ok = bool(resp) and not (isinstance(resp, dict) and (resp.get("error") or resp.get("errcode", 0)))
+    tip = "已推送到企微" if ok else f"推送失败：{resp}"
+    return HTMLResponse(_render_case_html(meta, waiting=waiting, tip=tip))
 
 
 @app.post("/admin/suggest")
@@ -268,13 +581,13 @@ async def admin_suggest(
 ) -> Dict[str, Any]:
     """
     GUI 模拟问答：不入库，直接走 WorkBuddy 建议链路。
-    body.notify_feishu=true 时，把建议按正式告警格式推到飞书 webhook。
+    body.notify_wecom / notify_feishu / push=true 时，推到企微群消息推送 Webhook。
     body.force_real=true 时可在 safe_mode 下仍真实推送（仅供本地联调）。
     """
     import time as _time
 
     from .models import IngestMessage, SenderKind, UnansweredCase
-    from .notify import build_feishu_alert_card, send_feishu_card
+    from .notify import format_alert_markdown, primary_wecom_webhook, send_webhook_markdown
     from .workbuddy import suggest_reply
 
     excerpt = str(body.get("question") or body.get("customer_excerpt") or "").strip()
@@ -284,7 +597,12 @@ async def admin_suggest(
     room_id = str(body.get("room_id") or "gui-sim").strip()
     product = str(body.get("product") or "js").strip() or "js"
     waiting = float(body.get("waiting_minutes") or 6)
-    notify_feishu = bool(body.get("notify_feishu") or body.get("push_feishu"))
+    notify = bool(
+        body.get("notify_wecom")
+        or body.get("notify_feishu")
+        or body.get("push_feishu")
+        or body.get("push")
+    )
     force_real = bool(body.get("force_real"))
     now = _time.time()
     msg = IngestMessage(
@@ -316,51 +634,51 @@ async def admin_suggest(
         "question": excerpt,
         "group_name": group_name,
         "room_id": room_id,
-        "notify_feishu": notify_feishu,
-        "feishu_pushed": False,
-        "feishu_resp": None,
+        "notify_wecom": notify,
+        "wecom_pushed": False,
+        "wecom_resp": None,
         "safe_mode": settings.safe_mode and not force_real,
     }
-    if notify_feishu:
-        if not (settings.feishu_notify_webhook or "").strip():
+    if notify:
+        hook = primary_wecom_webhook(settings)
+        if not hook:
             out["ok"] = False
-            out["error"] = "FEISHU_NOTIFY_WEBHOOK 未配置"
+            out["error"] = "WECOM_NOTIFY_WEBHOOK 未配置（企微内部群→添加消息推送→自定义）"
             return out
-        card = build_feishu_alert_card(
+        md = "【GUI 模拟推送】\n" + format_alert_markdown(
             group_name=group_name,
             room_id=room_id,
             waiting_minutes=waiting,
             excerpt=excerpt,
             suggestion=result.suggestion,
             source=f"{result.source}+gui",
-            prefix="【GUI模拟】",
         )
         use_safe = settings.safe_mode and not force_real
-        feishu_resp = await send_feishu_card(
-            settings.feishu_notify_webhook,
-            card,
-            safe_mode=use_safe,
-        )
-        out["feishu_resp"] = feishu_resp
-        out["feishu_pushed"] = bool(feishu_resp) and not (
-            isinstance(feishu_resp, dict) and feishu_resp.get("error")
+        wecom_resp = await send_webhook_markdown(hook, md, safe_mode=use_safe)
+        out["wecom_resp"] = wecom_resp
+        out["wecom_pushed"] = bool(wecom_resp) and not (
+            isinstance(wecom_resp, dict) and (wecom_resp.get("error") or wecom_resp.get("errcode", 0))
         )
         out["safe_mode"] = use_safe
+        # 兼容旧字段名
+        out["feishu_pushed"] = out["wecom_pushed"]
+        out["feishu_resp"] = wecom_resp
         if use_safe:
-            out["note"] = "safe_mode=true，未真实发飞书（仅日志）。可传 force_real=true 强制实发。"
-        elif not out["feishu_pushed"]:
+            out["note"] = "safe_mode=true，未真实发企微（仅日志）。可传 force_real=true 强制实发。"
+        elif not out["wecom_pushed"]:
             out["ok"] = False
-            out["error"] = "飞书推送失败，请检查 webhook"
+            out["error"] = "企微推送失败，请检查 WECOM_NOTIFY_WEBHOOK"
     return out
 
 
-@app.post("/admin/feishu-push")
-async def admin_feishu_push(
+@app.post("/admin/wecom-push")
+@app.post("/admin/feishu-push")  # 兼容旧 GUI / 旧路径名
+async def admin_wecom_push(
     body: Dict[str, Any],
     settings: Settings = Depends(get_settings),
 ) -> Dict[str, Any]:
-    """把已有建议文本推到飞书（GUI「推送上次结果」）。"""
-    from .notify import build_feishu_alert_card, send_feishu_card
+    """把已有建议推到企微群消息推送。"""
+    from .notify import format_alert_markdown, primary_wecom_webhook, send_webhook_markdown
 
     suggestion = str(body.get("suggestion") or "").strip()
     excerpt = str(body.get("question") or body.get("excerpt") or "").strip()
@@ -371,33 +689,31 @@ async def admin_feishu_push(
     waiting = float(body.get("waiting_minutes") or 6)
     source = str(body.get("source") or "gui").strip() or "gui"
     force_real = bool(body.get("force_real"))
-    if not (settings.feishu_notify_webhook or "").strip():
-        return {"ok": False, "error": "FEISHU_NOTIFY_WEBHOOK 未配置"}
-    card = build_feishu_alert_card(
+    hook = primary_wecom_webhook(settings)
+    if not hook:
+        return {"ok": False, "error": "WECOM_NOTIFY_WEBHOOK 未配置"}
+    md = "【GUI 模拟推送】\n" + format_alert_markdown(
         group_name=group_name,
         room_id=room_id,
         waiting_minutes=waiting,
         excerpt=excerpt or suggestion[:200],
         suggestion=suggestion,
         source=source,
-        prefix="【GUI模拟】",
     )
     use_safe = settings.safe_mode and not force_real
-    feishu_resp = await send_feishu_card(
-        settings.feishu_notify_webhook,
-        card,
-        safe_mode=use_safe,
-    )
-    pushed = bool(feishu_resp) and not (
-        isinstance(feishu_resp, dict) and feishu_resp.get("error")
+    wecom_resp = await send_webhook_markdown(hook, md, safe_mode=use_safe)
+    pushed = bool(wecom_resp) and not (
+        isinstance(wecom_resp, dict) and (wecom_resp.get("error") or wecom_resp.get("errcode", 0))
     )
     return {
         "ok": pushed or use_safe,
-        "feishu_pushed": pushed and not use_safe,
-        "feishu_resp": feishu_resp,
+        "wecom_pushed": pushed and not use_safe,
+        "feishu_pushed": pushed and not use_safe,  # 兼容旧字段
+        "wecom_resp": wecom_resp,
+        "feishu_resp": wecom_resp,
         "safe_mode": use_safe,
         "note": (
-            "safe_mode=true，未真实发飞书（仅日志）。可传 force_real=true 强制实发。"
+            "safe_mode=true，未真实发企微（仅日志）。可传 force_real=true 强制实发。"
             if use_safe
             else None
         ),

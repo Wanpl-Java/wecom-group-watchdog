@@ -125,6 +125,22 @@ class MessageStore:
         raw = data.get("open_alerts") or {}
         return {k: dict(v) for k, v in raw.items() if isinstance(v, dict)}
 
+    def get_open_alert(self, key: str) -> Optional[Dict[str, Any]]:
+        opens = self.list_open_alerts()
+        item = opens.get(key)
+        return dict(item) if item else None
+
+    def get_open_alert_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+        token = (token or "").strip()
+        if not token:
+            return None
+        for key, meta in self.list_open_alerts().items():
+            if str(meta.get("detail_token") or "") == token:
+                out = dict(meta)
+                out["key"] = key
+                return out
+        return None
+
     def mark_alert_resolved_notified(self, key: str) -> None:
         data = self._load_state()
         opens = data.setdefault("open_alerts", {})

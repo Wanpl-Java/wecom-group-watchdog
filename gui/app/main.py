@@ -313,8 +313,8 @@ class App(ctk.CTk):
         ).grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
         ctk.CTkButton(
             act,
-            text="生成并推飞书",
-            command=self.do_suggest_and_feishu,
+            text="生成并推企微",
+            command=self.do_suggest_and_wecom,
             fg_color=CYAN,
             hover_color="#67e8f9",
             text_color="#041018",
@@ -323,8 +323,8 @@ class App(ctk.CTk):
         ).grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
         ctk.CTkButton(
             act,
-            text="推送上次到飞书",
-            command=self.do_feishu_last,
+            text="推送上次到企微",
+            command=self.do_wecom_last,
             fg_color=PANEL2,
             hover_color="#16324a",
             border_width=1,
@@ -346,7 +346,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             sim,
-            text="「生成并推飞书」走 FEISHU_NOTIFY_WEBHOOK；消息带【GUI 模拟推送】前缀",
+            text="「生成并推企微」走 WECOM_NOTIFY_WEBHOOK（内部群→自定义消息推送）；带【GUI 模拟推送】前缀",
             text_color="#5b6b7c",
             font=ctk.CTkFont(size=11),
             anchor="w",
@@ -483,17 +483,17 @@ class App(ctk.CTk):
         threading.Thread(target=work, daemon=True).start()
 
     def do_suggest(self) -> None:
-        self._run_suggest(notify_feishu=False)
+        self._run_suggest(notify_wecom=False)
 
-    def do_suggest_and_feishu(self) -> None:
+    def do_suggest_and_wecom(self) -> None:
         if not messagebox.askyesno(
-            "推送到飞书",
-            "将生成建议并推送到 FEISHU_NOTIFY_WEBHOOK。\n确认继续？",
+            "推送到企微",
+            "将生成建议并推送到 WECOM_NOTIFY_WEBHOOK（内部群消息推送）。\n确认继续？",
         ):
             return
-        self._run_suggest(notify_feishu=True)
+        self._run_suggest(notify_wecom=True)
 
-    def _run_suggest(self, *, notify_feishu: bool) -> None:
+    def _run_suggest(self, *, notify_wecom: bool) -> None:
         q = self.q_text.get("1.0", "end").strip()
         if not q:
             messagebox.showwarning("提示", "请先填写模拟问题")
@@ -501,13 +501,13 @@ class App(ctk.CTk):
         group = self.group_var.get().strip() or "【JS】GUI模拟群"
         self._sync_client()
         self._set_log(
-            "正在生成建议并推飞书…" if notify_feishu else "正在生成建议（可能需 10–60 秒）…"
+            "正在生成建议并推企微…" if notify_wecom else "正在生成建议（可能需 10–60 秒）…"
         )
 
         def work() -> None:
             try:
                 data = self.client.suggest(
-                    q, group_name=group, notify_feishu=notify_feishu, force_real=True
+                    q, group_name=group, notify_wecom=notify_wecom, force_real=True
                 )
                 self._last_suggest = {
                     "suggestion": data.get("suggestion") or "",
@@ -515,44 +515,45 @@ class App(ctk.CTk):
                     "group_name": data.get("group_name") or group,
                     "source": data.get("source") or "gui",
                 }
-                feishu_line = ""
-                if notify_feishu:
-                    if data.get("feishu_pushed"):
-                        feishu_line = "飞书：已推送成功\n"
+                pushed = bool(data.get("wecom_pushed") or data.get("feishu_pushed"))
+                wecom_line = ""
+                if notify_wecom:
+                    if pushed:
+                        wecom_line = "企微：已推送成功\n"
                     elif data.get("safe_mode"):
-                        feishu_line = f"飞书：safe_mode 未实发 — {data.get('note')}\n"
+                        wecom_line = f"企微：safe_mode 未实发 — {data.get('note')}\n"
                     else:
-                        feishu_line = f"飞书：失败 — {data.get('error') or data.get('feishu_resp')}\n"
+                        err = data.get("error") or data.get("wecom_resp") or data.get("feishu_resp")
+                        wecom_line = f"企微：失败 — {err}\n"
                 block = (
                     f"=== 模拟问答 ===\n"
                     f"群: {data.get('group_name')}\n"
                     f"问: {data.get('question')}\n"
                     f"来源: {data.get('source')}\n"
-                    f"{feishu_line}\n"
+                    f"{wecom_line}\n"
                     f"{data.get('suggestion')}\n"
                 )
                 self.after(0, lambda: self._append(block))
                 self.after(
                     0,
                     lambda: self._set_log(
-                        f"suggest ok source={data.get('source')} "
-                        f"feishu_pushed={data.get('feishu_pushed')}"
+                        f"suggest ok source={data.get('source')} wecom_pushed={pushed}"
                     ),
                 )
-                if notify_feishu:
-                    if data.get("feishu_pushed"):
+                if notify_wecom:
+                    if pushed:
                         self.after(
                             0,
-                            lambda: messagebox.showinfo("飞书", "已推送到飞书机器人。"),
+                            lambda: messagebox.showinfo("企微", "已推送到企微群消息推送。"),
                         )
                     else:
                         self.after(
                             0,
                             lambda: messagebox.showwarning(
-                                "飞书",
+                                "企微",
                                 data.get("error")
                                 or data.get("note")
-                                or str(data.get("feishu_resp")),
+                                or str(data.get("wecom_resp") or data.get("feishu_resp")),
                             ),
                         )
             except Exception as e:  # noqa: BLE001
@@ -561,43 +562,44 @@ class App(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def do_feishu_last(self) -> None:
+    def do_wecom_last(self) -> None:
         if not self._last_suggest or not self._last_suggest.get("suggestion"):
-            messagebox.showwarning("提示", "还没有可推送的建议，请先点「仅生成建议」或「生成并推飞书」。")
+            messagebox.showwarning("提示", "还没有可推送的建议，请先点「仅生成建议」或「生成并推企微」。")
             return
-        if not messagebox.askyesno("推送上次结果", "将把上次生成的建议推送到飞书，确认？"):
+        if not messagebox.askyesno("推送上次结果", "将把上次生成的建议推送到企微，确认？"):
             return
         self._sync_client()
         payload = dict(self._last_suggest)
-        self._set_log("正在推送上次建议到飞书…")
+        self._set_log("正在推送上次建议到企微…")
 
         def work() -> None:
             try:
-                data = self.client.feishu_push(
+                data = self.client.wecom_push(
                     suggestion=payload["suggestion"],
                     question=payload.get("question") or "",
                     group_name=payload.get("group_name") or "【JS】GUI模拟群",
                     source=str(payload.get("source") or "gui") + "+replay",
                     force_real=True,
                 )
+                pushed = bool(data.get("wecom_pushed") or data.get("feishu_pushed"))
                 self.after(
                     0,
                     lambda: self._append(
-                        f"--- feishu push ---\n{json.dumps(data, ensure_ascii=False, indent=2)}\n"
+                        f"--- wecom push ---\n{json.dumps(data, ensure_ascii=False, indent=2)}\n"
                     ),
                 )
-                if data.get("feishu_pushed"):
-                    self.after(0, lambda: messagebox.showinfo("飞书", "上次建议已推送到飞书。"))
-                    self.after(0, lambda: self._set_log("feishu push ok"))
+                if pushed:
+                    self.after(0, lambda: messagebox.showinfo("企微", "上次建议已推送到企微。"))
+                    self.after(0, lambda: self._set_log("wecom push ok"))
                 else:
                     self.after(
                         0,
                         lambda: messagebox.showwarning(
-                            "飞书",
+                            "企微",
                             data.get("error") or data.get("note") or str(data),
                         ),
                     )
-                    self.after(0, lambda: self._set_log("feishu push failed"))
+                    self.after(0, lambda: self._set_log("wecom push failed"))
             except Exception as e:  # noqa: BLE001
                 self.after(0, lambda: messagebox.showerror("推送失败", str(e)))
 

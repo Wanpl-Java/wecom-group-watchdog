@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     scan_interval_minutes: int = 10
     unanswered_minutes: int = 10
     alert_cooldown_minutes: int = 30
+    # 未回复客户表（带详情超链接）推送间隔；0=关闭定时汇总
+    digest_interval_minutes: int = 30
+    # 企微 markdown 超链接用的可访问根地址，如 http://10.1.8.145:8092
+    # 留空则用 http://127.0.0.1:{app_port}（手机点不开，建议填局域网 IP）
+    public_base_url: str = ""
     work_hours_start: str = "09:00"
     work_hours_end: str = "22:00"
     timezone: str = "Asia/Shanghai"
@@ -47,8 +52,8 @@ class Settings(BaseSettings):
     # 请求体: {"title","text","group_name","room_id","waiting_minutes","suggestion"}
     generic_notify_webhook: str = ""
 
-    # 仅处理指定产品线：js / jumpserver / de / all（空=all）
-    watch_product: str = "js"
+    # 仅处理指定产品线：js / de / mk / all；多个用逗号：js,de,mk
+    watch_product: str = "js,de,mk"
     # WorkBuddy 话术 skill 路径（注入 desktop systemPrompt）
     workbuddy_style_skill: str = ""
 
@@ -81,6 +86,16 @@ class Settings(BaseSettings):
     followup_ai_judge: bool = True
 
     ingest_token: str = ""
+
+    # 推送未回复客户表前是否先跑 SentLink 同步 + 强制扫描（避免清单滞后）
+    digest_sync_before_send: bool = True
+
+    # 内部 Confluence Wiki（wiki.fit2cloud.cn），Bearer PAT；空 Token=关闭
+    confluence_base: str = "https://wiki.fit2cloud.cn"
+    confluence_user: str = ""
+    confluence_token: str = ""
+    # 可选：限制空间，逗号分隔，如 JS,FK；空=全站搜
+    confluence_space_keys: str = ""
 
     @property
     def data_path(self) -> Path:

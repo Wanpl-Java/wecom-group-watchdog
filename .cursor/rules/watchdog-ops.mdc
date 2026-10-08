@@ -1,0 +1,29 @@
+---
+description: wecom-group-watchdog 发送与回复格式约定
+alwaysApply: true
+---
+
+# Watchdog 操作约定
+
+## 发送前必须同步
+
+无论用户手动让你「发送 / 推送 / 再发一下」未回复客户表，还是定时 digest，**发送前都必须先同步一次 SentLink 群消息**，再扫描、再推送。
+
+- 服务端已内置：`push_pending_digest` 在 `DIGEST_SYNC_BEFORE_SEND=true`（默认）时会先 `bridge_sentlink --once` 再 `force scan`。
+- 若你绕过 API、自己拼推送，也必须先跑：
+  `.venv\Scripts\python.exe scripts\bridge_sentlink.py --once`
+
+## 无额外提示时只回表
+
+用户没有额外说明时，回复内容**只输出**未回复客户表本身（与企微 digest 同结构），不要加「已推送」「扫描成功」等旁白：
+
+```
+未回复客户表
+共 N 条 · 点击群名查看完整建议话术
+1. 【群名】 · 已等 X 分钟
+preview…
+```
+
+## 知识源
+
+建议话术参考：本地源码摘录 → 客户上下文 → kb.fit2cloud（高度匹配）→ 内部 Wiki Confluence（`CONFLUENCE_TOKEN` 配置后启用）。

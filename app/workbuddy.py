@@ -12,6 +12,7 @@ import httpx
 
 from .anti_aistyle import light_deai_customer_reply, load_anti_aistyle_block
 from .config import Settings
+from .confluence_kb import format_confluence_hint, search_confluence
 from .kb import format_kb_hint, match_kb_articles
 from .models import SuggestResult, UnansweredCase
 
@@ -31,8 +32,11 @@ _SYSTEM_OUTPUT_RULES = (
     "纯机制/原理咨询（如调用账号逻辑是什么）：第4段只讲清逻辑即可收束；"
     "禁止追问版本号、截图、复现步骤、是否报错、是否选错账号等补充说明。"
     "仅当客户明确报错/连不上/失败/异常时，第4段才可顺带要版本/报错/复现，并对照问题给排查方向。"
-    "回答优先级：①本地 jumpserver 源码/摘录 ②客户上下文 ③仅当prompt标明「知识库高度匹配」才给KB直链。"
-    "没有高度匹配时禁止贴知识库；禁止把原理类问题答成发布机部署/代填配置教程。"
+    "回答优先级：①本地 jumpserver 源码/摘录 ②客户上下文 "
+    "③仅当prompt标明「知识库高度匹配」才给 KB(kb.fit2cloud) 直链 "
+    "④内部 Wiki/Confluence（wiki.fit2cloud.cn）命中时可用于第3段内部分析，"
+    "对外第4段仅高度相关时嵌一条，禁止堆链接或编造未命中的 wiki 页。"
+    "没有高度匹配时禁止贴知识库/Wiki；禁止把原理类问题答成发布机部署/代填配置教程。"
     "问「远程应用调用/选账号逻辑」时：第3段讲两路账号从哪取、选取顺序；"
     "禁止展开发布机安装、OpenSSH/WinRM、代填脚本、发布机配置步骤；也不要贴这类KB。"
     "源码依据（摘录里有则照此说）：ConnectToken.account_object=授权选的目标资产账号；"
@@ -57,8 +61,14 @@ def _finalize_suggestion(text: str, customer_excerpt: str = "") -> str:
     return light_deai_customer_reply((text or "").strip(), customer_excerpt=customer_excerpt)
 
 
-def _build_prompt(case: UnansweredCase, hint: str, extra: str = "") -> str:
+def _build_prompt(
+    case: UnansweredCase,
+    hint: str,
+    extra: str = "",
+    settings: Optional[Settings] = None,
+) -> str:
     kb_block = format_kb_hint(case.customer_excerpt or "")
+    wiki_block = format_confluence_hint(case.customer_excerpt or "", settings)
     body = (
         f"{hint}\n\n"
         f"客户群: {case.group_name}\n"
@@ -67,12 +77,18 @@ def _build_prompt(case: UnansweredCase, hint: str, extra: str = "") -> str:
         f"最近对话:\n{case.customer_excerpt}\n"
         f"\n{kb_block}\n"
     )
+    if wiki_block:
+        body += f"\n{wiki_block}\n"
     if extra:
         body += f"\n本地代码/文档摘录（仅此范围内作答，未出现的结论不要编）：\n{extra}\n"
     return body
 
 
-def _case_payload(case: UnansweredCase, hint: str) -> Dict[str, Any]:
+def _case_payload(
+    case: UnansweredCase,
+    hint: str,
+    settings: Optional[Settings] = None,
+) -> Dict[str, Any]:
     return {
         "event": "unanswered_alert",
         "room_id": case.room_id,
@@ -84,7 +100,7 @@ def _case_payload(case: UnansweredCase, hint: str) -> Dict[str, Any]:
         "waiting_minutes": case.waiting_minutes,
         "customer_excerpt": case.customer_excerpt,
         "recent_messages": [m.model_dump() for m in case.recent_messages],
-        "prompt": _build_prompt(case, hint),
+        "prompt": _build_prompt(case, hint, settings=settings),
     }
 
 
@@ -107,15 +123,19 @@ async def suggest_reply(case: UnansweredCase, settings: Settings) -> SuggestResu
     return SuggestResult(suggestion=_fallback_suggestion(case), source="fallback")
 
 
-def _fallback_suggestion(case: UnansweredCase) -> str:
+def _fallback_suggestion(case: UnansweredCase, settings: Optional[Settings] = None) -> str:
     excerpt = (case.customer_excerpt or "").strip()
     short = excerpt if len(excerpt) <= 120 else excerpt[:120] + "…"
     hits = match_kb_articles(excerpt)
-    analysis = (
-        "自动兜底建议，需同事结合群上下文与版本信息再判。"
-        if not hits
-        else f"知识库高度匹配到《{hits[0][0]}》，可按文档引导；仍需确认版本与卡点。"
-    )
+    wiki_hits = search_confluence(excerpt, settings, limit=1) if settings else []
+    if hits:
+        analysis = f"知识库高度匹配到《{hits[0][0]}》，可按文档引导；仍需确认版本与卡点。"
+    elif wiki_hits:
+        analysis = (
+            f"内部 Wiki 命中《{wiki_hits[0][0]}》，可先对照该页排查；仍需确认版本与卡点。"
+        )
+    else:
+        analysis = "自动兜底建议，需同事结合群上下文与版本信息再判。"
     reply = (
         f"老师好，先按这篇看下：{hits[0][1]}，卡点把版本和截图发我。"
         if hits
@@ -468,7 +488,9 @@ async def _via_desktop_gateway(case: UnansweredCase, settings: Settings) -> Sugg
     url = f"{base}/api/v1/llm/completions"
     payload = {
         "systemPrompt": system_prompt,
-        "userPrompt": _build_prompt(case, settings.suggest_system_hint, snippets),
+        "userPrompt": _build_prompt(
+            case, settings.suggest_system_hint, snippets, settings=settings
+        ),
         "temperature": 0.3,
         "maxTokens": 1200,
         "maxTurns": 8,
@@ -541,7 +563,9 @@ async def _via_ai_gateway(case: UnansweredCase, settings: Settings) -> SuggestRe
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
-    user_prompt = _build_prompt(case, settings.suggest_system_hint, snippets)
+    user_prompt = _build_prompt(
+        case, settings.suggest_system_hint, snippets, settings=settings
+    )
     payload = {
         "model": model,
         "stream": False,
@@ -583,7 +607,7 @@ async def _via_webhook(case: UnansweredCase, settings: Settings) -> SuggestResul
     if settings.workbuddy_webhook_token:
         headers["Authorization"] = f"Bearer {settings.workbuddy_webhook_token}"
 
-    payload = _case_payload(case, settings.suggest_system_hint)
+    payload = _case_payload(case, settings.suggest_system_hint, settings=settings)
     try:
         async with httpx.AsyncClient(timeout=settings.workbuddy_timeout_seconds) as client:
             resp = await client.post(url, json=payload, headers=headers)
@@ -631,7 +655,7 @@ async def _via_local_cmd(case: UnansweredCase, settings: Settings) -> SuggestRes
         logger.warning("WORKBUDDY_LOCAL_CMD empty, fallback")
         return SuggestResult(suggestion=_fallback_suggestion(case), source="fallback")
 
-    body = _case_payload(case, settings.suggest_system_hint)
+    body = _case_payload(case, settings.suggest_system_hint, settings=settings)
     args = shlex.split(cmd, posix=False)
     script = next((a for a in args if a.endswith(".py")), "")
     if not script or not Path(script).is_file():

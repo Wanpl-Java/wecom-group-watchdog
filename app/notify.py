@@ -70,21 +70,75 @@ async def send_app_text(
 
 
 async def send_webhook_markdown(webhook: str, content: str, safe_mode: bool) -> Optional[dict]:
-    """企业微信群机器人 Webhook。"""
+    """企业微信群机器人 / 自定义消息推送 Webhook。"""
     if not webhook:
         return None
     if safe_mode:
         logger.info("[SAFE_MODE] would post wecom webhook: %s", content[:300])
         return {"safe_mode": True}
-    payload = {"msgtype": "markdown", "markdown": {"content": content}}
+    # 企微 markdown 建议控制在约 4096 字节内
+    text = (content or "")[:3500]
+    payload = {"msgtype": "markdown", "markdown": {"content": text}}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(webhook, json=payload)
             resp.raise_for_status()
-            return resp.json() if resp.content else {"ok": True}
+            data = resp.json() if resp.content else {"ok": True}
+            if isinstance(data, dict) and data.get("errcode", 0) not in (0, None):
+                logger.error("wecom webhook failed: %s", data)
+            return data
     except Exception:  # noqa: BLE001
         logger.exception("wecom notify webhook failed")
         return {"error": True}
+
+
+def format_resolved_markdown(group_name: str, room_id: str) -> str:
+    return (
+        f"### 客户群已跟进\n"
+        f"> 群：<font color=\"info\">{group_name}</font>\n"
+        f"> room：`{room_id}`\n"
+        f"> 状态：同事已在群内回复，本条可关闭"
+    )
+
+
+def format_pending_list_markdown(items: List[Dict[str, Any]]) -> str:
+    """未回复客户表：群名可点开详情页（企微 markdown 超链接）。"""
+    if not items:
+        return (
+            '### <font color="info">未回复客户表</font>\n'
+            "当前没有待跟进项。"
+        )
+    lines = [
+        '### <font color="warning">未回复客户表</font>',
+        f"共 <font color=\"warning\">{len(items)}</font> 条 · 点击群名查看完整建议话术\n",
+    ]
+    for i, it in enumerate(items[:25], 1):
+        g = str(it.get("group_name") or it.get("room_id") or "")
+        wait = it.get("waiting_minutes")
+        wait_s = f"{wait} 分钟" if wait is not None else "-"
+        preview = str(it.get("preview") or "（无摘录）").replace("\n", " ")[:80]
+        detail_url = str(it.get("detail_url") or "").strip()
+        title = f"[{g}]({detail_url})" if detail_url else f"**{g}**"
+        lines.append(f"{i}. {title} · 已等 {wait_s}\n> {preview}\n")
+    if len(items) > 25:
+        lines.append(f"…另有 {len(items) - 25} 条未列出")
+    return "\n".join(lines)[:3500]
+
+
+def public_base_url(settings: Settings) -> str:
+    base = (settings.public_base_url or "").strip().rstrip("/")
+    if base:
+        return base
+    return f"http://127.0.0.1:{settings.app_port}"
+
+
+def case_detail_url(settings: Settings, token: str) -> str:
+    return f"{public_base_url(settings)}/case/{token}"
+
+
+def primary_wecom_webhook(settings: Settings) -> str:
+    """主通知通道：企微群消息推送 Webhook。"""
+    return (settings.wecom_notify_webhook or "").strip()
 
 
 async def send_feishu_text(webhook: str, content: str, safe_mode: bool) -> Optional[dict]:
@@ -351,13 +405,42 @@ def format_alert_markdown(
     suggestion: str,
     source: str,
 ) -> str:
-    return (
-        f"### 客户群待跟进提醒\n"
-        f"> 群：**{group_name}**\n"
-        f"> room_id: `{room_id}`\n"
-        f"> 已等待：**{waiting_minutes}** 分钟无内部回复\n\n"
-        f"**最近对话**\n"
-        f"```\n{excerpt[:800]}\n```\n\n"
-        f"**内部建议**（来源: {source}）\n"
-        f"{suggestion[:2200]}"
+    """企微群消息推送 markdown（主通知格式）。"""
+    secs = parse_suggestion_sections(suggestion)
+    reply = (secs.get("reply") or suggestion or "").strip()[:1800]
+    analysis = (secs.get("analysis") or "").strip()[:800]
+    qtype = (secs.get("type") or "").strip()[:200]
+    excerpt_s = (excerpt or "").strip().replace("\r\n", "\n")[:800]
+    if excerpt_s:
+        # 引用块里换行用空格，避免企微折叠难看；保留可读性
+        excerpt_q = " ".join(excerpt_s.split())[:500]
+    else:
+        excerpt_q = "（无）"
+
+    def _section(color: str, title: str) -> str:
+        # 企微 markdown：彩色 + 书名号标题，比单纯 **加粗** 更醒目
+        return f'<font color="{color}">【{title}】</font>'
+
+    lines = [
+        f'### <font color="warning">客户群待跟进提醒</font>',
+        f"> 群：<font color=\"warning\">{group_name}</font>",
+        f"> room：`{room_id}`",
+        f"> 已等待：<font color=\"warning\">{waiting_minutes}</font> 分钟 · 来源 `{source}`",
+        "",
+        _section("info", "客户原话"),
+        f"> {excerpt_q}",
+    ]
+    if qtype:
+        lines.extend(["", _section("comment", "问题类型"), qtype])
+    if analysis:
+        lines.extend(["", _section("comment", "内部分析"), analysis])
+    lines.extend(
+        [
+            "",
+            _section("warning", "可复制回复"),
+            "```",
+            reply or "（暂无建议）",
+            "```",
+        ]
     )
+    return "\n".join(lines)[:3500]

@@ -44,7 +44,7 @@ class WatchdogClient:
         group_name: str = "【JS】GUI模拟群",
         waiting_minutes: float = 6.0,
         product: str = "js",
-        notify_feishu: bool = False,
+        notify_wecom: bool = False,
         force_real: bool = True,
     ) -> Dict[str, Any]:
         with httpx.Client(timeout=self.timeout) as c:
@@ -55,14 +55,14 @@ class WatchdogClient:
                     "group_name": group_name,
                     "waiting_minutes": waiting_minutes,
                     "product": product,
-                    "notify_feishu": notify_feishu,
+                    "notify_wecom": notify_wecom,
                     "force_real": force_real,
                 },
             )
             r.raise_for_status()
             return r.json()
 
-    def feishu_push(
+    def wecom_push(
         self,
         suggestion: str,
         question: str = "",
@@ -70,9 +70,10 @@ class WatchdogClient:
         source: str = "gui",
         force_real: bool = True,
     ) -> Dict[str, Any]:
+        """推送到企微群消息推送。"""
         with httpx.Client(timeout=30.0) as c:
             r = c.post(
-                f"{self.base_url}/admin/feishu-push",
+                f"{self.base_url}/admin/wecom-push",
                 json={
                     "suggestion": suggestion,
                     "question": question,
@@ -83,6 +84,10 @@ class WatchdogClient:
             )
             r.raise_for_status()
             return r.json()
+
+    # 兼容旧调用名
+    def feishu_push(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return self.wecom_push(*args, **kwargs)
 
     def rooms(self) -> Dict[str, Any]:
         with httpx.Client(timeout=15.0) as c:

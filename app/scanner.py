@@ -57,14 +57,10 @@ _ACK_EXACT = {
 }
 
 
-def is_customer_ack(content: str) -> bool:
-    """客户短确认语（如「收到」）不算待跟进。"""
-    raw = (content or "").strip()
-    if not raw:
-        return True
-    # 去掉常见标点再比
-    compact = (
-        raw.replace(" ", "")
+def _strip_punct(s: str) -> str:
+    return (
+        (s or "")
+        .replace(" ", "")
         .replace("　", "")
         .replace("!", "")
         .replace("！", "")
@@ -72,7 +68,18 @@ def is_customer_ack(content: str) -> bool:
         .replace(".", "")
         .replace("~", "")
         .replace("～", "")
+        .replace("，", "")
+        .replace(",", "")
+        .replace("、", "")
     )
+
+
+def is_customer_ack(content: str) -> bool:
+    """客户短确认语（如「收到」）不算待跟进。"""
+    raw = (content or "").strip()
+    if not raw:
+        return True
+    compact = _strip_punct(raw)
     low = compact.lower()
     if low in {x.lower() for x in _ACK_EXACT}:
         return True
@@ -86,6 +93,186 @@ def is_customer_ack(content: str) -> bool:
             return False
         return True
     return False
+
+
+# 客户明确表示问题已结束（比「收到/谢谢」更强；可稍长）
+_RESOLVED_PHRASES = (
+    "已解决",
+    "已经解决",
+    "解决了",
+    "搞好了",
+    "弄好了",
+    "处理好了",
+    "可以了",
+    "已经可以了",
+    "好了可以了",
+    "已经好了",
+    "没问题了",
+    "没有问题了",
+    "不用了",
+    "不需要了",
+    "先不用了",
+    "暂时不用了",
+    "先这样吧",
+    "先这样",
+    "没事了",
+    "已经通了",
+    "通了",
+    "能登了",
+    "能登录了",
+    "登录成功了",
+    "连上了",
+    "连得上了",
+    "恢复了",
+    "正常了",
+    "好用了",
+    "搞定了",
+    "ok了",
+    "ok啦",
+    "已恢复",
+    "问题解决了",
+    "问题已解决",
+)
+
+
+def is_customer_issue_closed(content: str) -> bool:
+    """
+    客户明确表示问题已结束/不需要再跟。
+    注意：单独「谢谢/好的」不算完结（仍走 is_customer_ack），避免礼貌用语误关。
+    """
+    raw = (content or "").strip()
+    if not raw:
+        return False
+    # 仍在求助/报错，不算完结
+    if any(
+        x in raw
+        for x in (
+            "?",
+            "？",
+            "怎么",
+            "如何",
+            "吗",
+            "呢",
+            "失败",
+            "报错",
+            "不行",
+            "还是",
+            "仍然",
+            "无法",
+            "不能",
+            "连不上",
+            "登不上",
+            "帮忙",
+            "求助",
+        )
+    ):
+        # 「还是不行」明确未解决
+        if any(x in raw for x in ("还是", "仍然", "依旧", "还是不行", "还没", "还未")):
+            return False
+        # 「可以了吗」是在问，不算完结
+        if any(x in raw for x in ("吗", "？", "?")):
+            return False
+
+    compact = _strip_punct(raw).lower()
+    if not compact:
+        return False
+    # 整句很短且就是完结语
+    for p in _RESOLVED_PHRASES:
+        pl = _strip_punct(p).lower()
+        if compact == pl or compact.startswith(pl) or pl in compact:
+            # 过长闲聊里偶然出现「通了」等，要求整体不太长
+            if len(compact) <= 40 or compact.endswith(pl) or compact.startswith(pl):
+                return True
+    # 「好了 + 谢谢」类（中等长度）
+    if len(compact) <= 24 and ("好了" in compact or "可以了" in compact or "解决" in compact):
+        if any(x in compact for x in ("谢谢", "感谢", "麻烦了", "多谢")):
+            return True
+    return False
+
+
+_REACTION_TOKENS = (
+    "哦",
+    "噢",
+    "喔",
+    "好吧",
+    "行吧",
+    "那行",
+    "那好吧",
+    "知道了",
+    "了解",
+    "明白",
+    "无语",
+    "失望",
+    "唉",
+    "哎",
+    "嗯",
+    "ok",
+    "okay",
+)
+
+
+def _strip_wecom_quote(content: str) -> str:
+    """去掉企微引用块，返回客户自己跟的那截。"""
+    raw = (content or "").strip()
+    if not raw:
+        return ""
+    # 「被引用内容」 ----- 客户补充
+    if "「" in raw and "」" in raw:
+        after = raw.rsplit("」", 1)[-1]
+        after = after.replace("-", "").replace("—", "").replace(" ", "").replace("　", "").strip()
+        return after
+    if "------" in raw:
+        after = raw.split("------")[-1].strip()
+        return after
+    return raw
+
+
+def is_customer_reaction_only(content: str) -> bool:
+    """
+    引用同事方案后只发表情/短反应（如「[失望]」「好吧」），没有新问题。
+    不当作待跟进。
+    """
+    raw = (content or "").strip()
+    if not raw:
+        return False
+    is_quote = ("「" in raw and "」" in raw) or ("------" in raw) or ("这是一条引用" in raw)
+    rest = _strip_wecom_quote(raw) if is_quote else raw
+    rest = rest.strip()
+    if not rest:
+        return True if is_quote else False
+    # 仍在提问/报错则不算反应
+    if any(
+        x in rest
+        for x in ("?", "？", "怎么", "如何", "吗", "呢", "失败", "报错", "不行", "还是", "无法", "不能", "帮忙")
+    ):
+        return False
+    compact = _strip_punct(rest)
+    compact = (
+        compact.replace("[", "")
+        .replace("]", "")
+        .replace("【", "")
+        .replace("】", "")
+        .lower()
+    )
+    if not compact:
+        return True if is_quote else False
+    # 纯表情/很短反应
+    if is_quote and len(compact) <= 12:
+        return True
+    if compact in {x.lower() for x in _REACTION_TOKENS}:
+        return True
+    if len(compact) <= 8 and any(t in compact for t in _REACTION_TOKENS):
+        return True
+    return False
+
+
+def customer_needs_no_followup(content: str) -> bool:
+    """确认语、明确完结、或引用同事后的短反应 → 不需要再当待跟进。"""
+    return (
+        is_customer_ack(content)
+        or is_customer_issue_closed(content)
+        or is_customer_reaction_only(content)
+    )
 
 
 def _staff_before_customer(recent: list, customer_at: float) -> bool:
@@ -108,21 +295,63 @@ def is_de_room_name(name: str) -> bool:
     )
 
 
-def match_watch_product(name: str, product: str, watch_product: str) -> bool:
-    """watch_product: js|jumpserver|de|dataease|all|空."""
+def is_mk_room_name(name: str) -> bool:
+    n = name or ""
+    u = n.upper()
+    return (
+        ("【MK" in n)
+        or ("[MK" in u)
+        or ("MK】" in n)
+        or ("MaxKB" in n)
+        or ("MAXKB" in u)
+    )
+
+
+def _parse_watch_products(watch_product: str) -> List[str]:
     wp = (watch_product or "all").strip().lower()
     if wp in ("", "all", "*"):
-        return True
+        return ["all"]
+    parts = [
+        p.strip()
+        for p in wp.replace("+", ",").replace("|", ",").replace(" ", ",").split(",")
+        if p.strip()
+    ]
+    return parts or ["all"]
+
+
+def _match_one_product(name: str, product: str, wp: str) -> bool:
     pname = (product or "").strip().lower()
     if wp in ("js", "jumpserver"):
         if pname in ("jumpserver", "js"):
             return True
-        return is_js_room_name(name) and not is_de_room_name(name)
+        return is_js_room_name(name) and not is_de_room_name(name) and not is_mk_room_name(name)
     if wp in ("de", "dataease"):
         if pname in ("dataease", "de"):
             return True
         return is_de_room_name(name)
-    return True
+    if wp in ("mk", "maxkb"):
+        if pname in ("maxkb", "mk"):
+            return True
+        return is_mk_room_name(name)
+    return False
+
+
+def match_watch_product(name: str, product: str, watch_product: str) -> bool:
+    """watch_product: js|de|mk|all，或多个逗号分隔如 js,de,mk。"""
+    parts = _parse_watch_products(watch_product)
+    if "all" in parts:
+        return True
+    return any(_match_one_product(name, product, p) for p in parts)
+
+
+def infer_product_from_room_name(name: str) -> str:
+    if is_js_room_name(name):
+        return "jumpserver"
+    if is_de_room_name(name):
+        return "dataease"
+    if is_mk_room_name(name):
+        return "maxkb"
+    return ""
 
 
 def resolve_sender_kind(
@@ -208,6 +437,12 @@ def find_unanswered(
             continue
         if last_staff_after_customer:
             continue
+        # 客户明确表示已解决 / 不用了 → 视为完结
+        if is_customer_issue_closed(last_customer.content):
+            continue
+        # 引用同事答复后只发表情/「好吧」等，没有新问题
+        if is_customer_reaction_only(last_customer.content):
+            continue
         # 「收到 / 好的 / ok」等确认语：尤其是同事刚发完方案后，不算待跟进
         if is_customer_ack(last_customer.content) and _staff_before_customer(
             recent, last_customer.sent_at
@@ -228,9 +463,7 @@ def find_unanswered(
             excerpt_lines.append(f"[{role}] {who}: {m.content[:200]}")
 
         support = registry.resolve_support_userids(group, room_name) or default_support
-        product = group.product or (
-            "jumpserver" if is_js_room_name(room_name) else ("dataease" if is_de_room_name(room_name) else "")
-        )
+        product = group.product or infer_product_from_room_name(room_name)
         cases.append(
             UnansweredCase(
                 room_id=room_id,

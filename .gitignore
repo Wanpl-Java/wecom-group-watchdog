@@ -21,3 +21,10 @@ gui/*.spec
 
 .env.bak*
 
+# Confluence PAT（skill 本地凭证）
+skills/**/confluence.env
+**/confluence.env
+
+# 本地探测脚本产物
+scripts/_probe_confluence.py
+

@@ -165,15 +165,40 @@ def is_de_room(name: str) -> bool:
     )
 
 
+def is_mk_room(name: str) -> bool:
+    n = name or ""
+    u = n.upper()
+    return (
+        ("【MK" in n)
+        or ("[MK" in u)
+        or ("MK】" in n)
+        or ("MaxKB" in n)
+        or ("MAXKB" in u)
+    )
+
+
 def match_watch_product(name: str, watch_product: str) -> bool:
     wp = (watch_product or "all").strip().lower()
     if wp in ("", "all", "*"):
         return True
-    if wp in ("js", "jumpserver"):
-        return is_js_room(name) and not is_de_room(name)
-    if wp in ("de", "dataease"):
-        return is_de_room(name)
-    return True
+    parts = [
+        p.strip()
+        for p in wp.replace("+", ",").replace("|", ",").replace(" ", ",").split(",")
+        if p.strip()
+    ]
+    if not parts or "all" in parts:
+        return True
+
+    def one(p: str) -> bool:
+        if p in ("js", "jumpserver"):
+            return is_js_room(name) and not is_de_room(name) and not is_mk_room(name)
+        if p in ("de", "dataease"):
+            return is_de_room(name)
+        if p in ("mk", "maxkb"):
+            return is_mk_room(name)
+        return False
+
+    return any(one(p) for p in parts)
 
 
 def sync_once() -> int:
