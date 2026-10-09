@@ -50,6 +50,12 @@ class MessageStore:
         inserted = 0
         with self._lock, self._connect() as conn:
             for m in messages:
+                if (m.msg_type or "") == "revoke":
+                    target = (m.content or "").strip()
+                    if target:
+                        conn.execute("DELETE FROM messages WHERE msg_id = ?", (target,))
+                    inserted += 1
+                    continue
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO messages
@@ -103,6 +109,25 @@ class MessageStore:
         alerts = data.get("alerts") or {}
         val = alerts.get(key)
         return float(val) if val is not None else None
+
+    def get_followup_judge(self, key: str) -> Optional[Dict[str, Any]]:
+        data = self._load_state()
+        item = (data.get("followup_judged") or {}).get(key)
+        return dict(item) if isinstance(item, dict) else None
+
+    def clear_followup_judges(self) -> None:
+        data = self._load_state()
+        data["followup_judged"] = {}
+        self._save_state(data)
+
+    def set_followup_judge(self, key: str, need: bool, reason: str) -> None:
+        data = self._load_state()
+        judged = data.setdefault("followup_judged", {})
+        judged[key] = {"need": bool(need), "reason": reason, "at": time.time()}
+        if len(judged) > 400:
+            ordered = sorted(judged.items(), key=lambda kv: float((kv[1] or {}).get("at") or 0))
+            data["followup_judged"] = dict(ordered[-400:])
+        self._save_state(data)
 
     def set_alert_at(self, key: str, ts: Optional[float] = None) -> None:
         data = self._load_state()

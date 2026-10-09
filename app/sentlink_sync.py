@@ -25,7 +25,7 @@ def run_sentlink_sync() -> Dict[str, Any]:
             return {"ok": False, "error": "cannot load bridge_sentlink"}
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        inserted = int(mod.sync_once() or 0)
+        inserted = int(mod.sync_once(full_today=True) or 0)
         logger.info("pre-send SentLink sync inserted=%s", inserted)
         return {"ok": True, "inserted": inserted}
     except SystemExit as exc:

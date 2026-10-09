@@ -18,12 +18,43 @@ _JUDGE_SYSTEM = (
     '{"need_followup":true/false,"reason":"一句话"}。'
     "判定规则（按序，命中即止）："
     "1) 客户明确表示已解决/搞好了/可以了/不用了/没事了/能登了/连上了/正常了 → false；"
-    "2) 客户只是确认收到/谢谢/好的/ok/表情，或引用同事答复后只发表情/失望/好吧等短反应、没有新问题 → false；"
-    "2b) 同事已给完方案（含产品不支持/能力边界），客户未提出新问法 → false；"
-    "3) 客户在提问题、报错、要方案、催进度、说还没好/还是不行 → true；"
-    "4) 注意：单独「谢谢」「好的」不等于问题已解决；但「好了谢谢」「已经可以了」算完结 → false；"
-    "5) 不确定时偏向 true（宁可提醒，不要漏未回复的真问题）。"
+    "2) 客户只是确认或等待：收到/谢谢/好的/ok/稍等/等一下/好吧/行/0/单独一个@或只@某人，没有说方案无效，也没有新问题 → false；"
+    "2b) 同事已答应稍后处理或已经给出步骤，客户只重复一句名词、没有新报错 → false；"
+    "3) 同事已回复后，客户表示没用/没有用/不管用/没解决/还是不行/无法完成某操作（如「无法复制这个」）→ true，这不是问句也要跟；"
+    "4) 客户在提问题、报错、要方案、催进度，或只发「在吗」等人还在等回复 → true；"
+    "5) 不确定时偏向 true。但等待时间再长，也不能把第2条的「稍等/好的/@/0」改判成 true。"
 )
+
+
+_NO_FOLLOWUP_EXACT = {
+    "",
+    "稍等",
+    "稍等下",
+    "稍等一下",
+    "等下",
+    "等一下",
+    "等会",
+    "好的",
+    "好",
+    "ok",
+    "okay",
+    "好吧",
+    "行",
+    "0",
+    "1",
+    "收到",
+    "谢谢",
+    "嗯",
+    "嗯嗯",
+}
+
+
+def _is_plain_ack_or_mention(text: str) -> bool:
+    """同事已回复后，客户只剩 @、稍等、好的、0 这类，等再久也不算待跟进。"""
+    from .scanner import _strip_punct, customer_own_text
+
+    own = _strip_punct(customer_own_text(text)).lower()
+    return own in _NO_FOLLOWUP_EXACT
 
 
 def _last_customer_text(case: UnansweredCase) -> str:
@@ -68,16 +99,8 @@ async def ai_needs_followup(case: UnansweredCase, settings: Settings) -> Tuple[b
         return True, "ai_unavailable_default_alert"
 
     last = _last_customer_text(case)
-    # 本地规则先挡一层，少打 AI、少误报
-    from .scanner import is_customer_ack, is_customer_issue_closed, is_customer_reaction_only
-
-    if is_customer_issue_closed(last):
-        return False, "local_resolved"
-    if is_customer_reaction_only(last):
-        return False, "local_reaction"
-    if is_customer_ack(last):
-        return False, "local_ack"
-
+    if _is_plain_ack_or_mention(last):
+        return False, "local_ack_or_mention"
     excerpt = (case.customer_excerpt or "")[-1200:]
     user = (
         f"群：{case.group_name}\n"

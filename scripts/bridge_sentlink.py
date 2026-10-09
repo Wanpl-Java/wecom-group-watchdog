@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib import error, parse, request
@@ -58,8 +59,8 @@ def save_state(path: Path, state: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # 只保留最近 N 条去重指纹，避免无限膨胀
     seen = state.get("seen_msg_ids") or []
-    if len(seen) > 5000:
-        state["seen_msg_ids"] = seen[-5000:]
+    if len(seen) > 50000:
+        state["seen_msg_ids"] = seen[-50000:]
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -114,13 +115,6 @@ def map_sender_kind(item: Dict[str, Any]) -> str:
 
 
 def to_ingest_message(item: Dict[str, Any], room_name: str = "") -> Optional[Dict[str, Any]]:
-    if (item.get("msgtype") or "") != "text":
-        return None
-    if (item.get("action") or "send") != "send":
-        return None
-    content = (item.get("content_text") or "").strip()
-    if not content:
-        return None
     msgid = item.get("msgid") or ""
     roomid = item.get("roomid") or item.get("ext_chat_id") or ""
     if not msgid or not roomid:
@@ -128,17 +122,29 @@ def to_ingest_message(item: Dict[str, Any], room_name: str = "") -> Optional[Dic
     msgtime = int(item.get("msgtime") or 0)
     # SentLink 存档时间为毫秒
     sent_at = msgtime / 1000.0 if msgtime > 10_000_000_000 else float(msgtime)
-    return {
+    action = (item.get("action") or "send").lower()
+    msgtype = (item.get("msgtype") or "").lower()
+    base = {
         "msg_id": msgid,
         "room_id": roomid,
         "room_name": room_name or item.get("group_chat_name") or "",
         "sender_id": item.get("from") or "",
         "sender_name": "",
         "sender_kind": map_sender_kind(item),
-        "content": content,
         "sent_at": sent_at,
-        "msg_type": "text",
     }
+    # 撤回：content 放被撤回消息的 msgid，入库时删掉原文
+    if action == "recall" or msgtype == "revoke":
+        pre = (item.get("pre_msgid") or "").strip()
+        if not pre:
+            return None
+        return {**base, "content": pre, "msg_type": "revoke"}
+    if msgtype != "text" or action != "send":
+        return None
+    content = (item.get("content_text") or "").strip()
+    if not content:
+        return None
+    return {**base, "content": content, "msg_type": "text"}
 
 
 def is_js_room(name: str) -> bool:
@@ -201,7 +207,17 @@ def match_watch_product(name: str, watch_product: str) -> bool:
     return any(one(p) for p in parts)
 
 
-def sync_once() -> int:
+def _today_start_ms() -> int:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    start = datetime.now(ZoneInfo("Asia/Shanghai")).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return int(start.timestamp() * 1000)
+
+
+def sync_once(full_today: bool = False) -> int:
     base = env("SENTLINK_BASE_URL", "https://csm.fit2cloud.cn")
     api_key = env("SENTLINK_API_KEY")
     staff = env("SENTLINK_EXT_STAFF_ID", "WanPeiLin")
@@ -267,12 +283,31 @@ def sync_once() -> int:
 
     batch: List[Dict[str, Any]] = []
     max_msgtime = last_msgtime
+    room_cursor = dict(state.get("room_msgtime") or {})
+    pending_rooms = _pending_room_ids(state_path)
+    today_ms = _today_start_ms() if full_today else 0
+    skipped_quiet = 0
+    to_fetch: List[Dict[str, Any]] = []
 
     for sess in room_list:
         room_id = sess.get("roomid") or ""
-        room_name = sess.get("group_chat_name") or ""
         if not room_id:
             continue
+        sess_mt = int(sess.get("msgtime") or 0)
+        prev_mt = int(room_cursor.get(room_id) or 0)
+        # 发送前：今天有过消息的群全部重拉，不看本地游标
+        if full_today and sess_mt >= today_ms:
+            to_fetch.append(sess)
+            continue
+        # 会话时间没变、且不在待跟进里：跳过拉消息，避免每次全量打 100+ 个群
+        if prev_mt and sess_mt and sess_mt <= prev_mt and room_id not in pending_rooms:
+            skipped_quiet += 1
+            continue
+        to_fetch.append(sess)
+
+    def _pull_room(sess: Dict[str, Any]) -> List[Dict[str, Any]]:
+        room_id = sess.get("roomid") or ""
+        room_name = sess.get("group_chat_name") or ""
         msgs_resp = api_get(
             base,
             "/api/v1/console/group-chat/session-msgs",
@@ -287,27 +322,43 @@ def sync_once() -> int:
             },
             tenant_id=tenant,
         )
-        msgs = ((msgs_resp.get("data") or {}).get("items")) or []
-        for m in msgs:
+        out: List[Dict[str, Any]] = []
+        for m in ((msgs_resp.get("data") or {}).get("items")) or []:
             mapped = to_ingest_message(m, room_name=room_name)
-            if not mapped:
-                continue
-            mt = int(m.get("msgtime") or 0)
+            if mapped:
+                out.append(mapped)
+        return out
+
+    pulled: List[List[Dict[str, Any]]] = []
+    if to_fetch:
+        workers = min(8, len(to_fetch))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pulled = list(pool.map(_pull_room, to_fetch))
+
+    if last_msgtime == 0:
+        window_h = float(env("BRIDGE_BOOTSTRAP_HOURS", "6") or "6")
+    else:
+        window_h = float(env("BRIDGE_LOOKBACK_HOURS", "48") or "48")
+    cutoff_ms = int((time.time() - window_h * 3600) * 1000)
+    for sess, msgs in zip(to_fetch, pulled):
+        room_id = sess.get("roomid") or ""
+        sess_mt = int(sess.get("msgtime") or 0)
+        prev_mt = int(room_cursor.get(room_id) or 0)
+        for mapped in msgs:
+            mt = int(float(mapped.get("sent_at") or 0) * 1000)
             if mapped["msg_id"] in seen:
                 continue
-            # 首次运行：只取最近 bootstrap 小时，避免灌入历史全量
-            if last_msgtime == 0:
-                bootstrap_h = float(env("BRIDGE_BOOTSTRAP_HOURS", "6") or "6")
-                cutoff_ms = int((time.time() - bootstrap_h * 3600) * 1000)
-                if mt and mt < cutoff_ms:
-                    continue
-            elif mt and mt <= last_msgtime:
+            if mt and mt < cutoff_ms:
                 continue
             batch.append(mapped)
             seen.add(mapped["msg_id"])
             if mt > max_msgtime:
                 max_msgtime = mt
+        if sess_mt:
+            room_cursor[room_id] = max(prev_mt, sess_mt)
 
+    print(f"[bridge] skipped_quiet={skipped_quiet} fetched={len(to_fetch)}")
+    state["room_msgtime"] = room_cursor
     if not batch:
         print("[bridge] no new messages")
         state["seen_msg_ids"] = list(seen)
@@ -323,8 +374,23 @@ def sync_once() -> int:
 
     state["seen_msg_ids"] = list(seen)
     state["last_msgtime"] = max_msgtime or last_msgtime
+    state["room_msgtime"] = room_cursor
     save_state(state_path, state)
     return len(batch)
+
+
+def _pending_room_ids(state_path: Path) -> set:
+    """待跟进群每次都拉，避免会话时间没变时漏掉迟到存档。"""
+    path = state_path.parent / "state.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return set()
+    rooms = set()
+    for meta in (data.get("open_alerts") or {}).values():
+        if isinstance(meta, dict) and meta.get("room_id"):
+            rooms.add(str(meta["room_id"]))
+    return rooms
 
 
 def main() -> int:

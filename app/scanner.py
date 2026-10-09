@@ -54,6 +54,16 @@ _ACK_EXACT = {
     "好滴",
     "收到谢谢",
     "收到，谢谢",
+    "稍等",
+    "稍等下",
+    "稍等一下",
+    "等下",
+    "等一下",
+    "好的稍等",
+    "可以",
+    "可以的",
+    "方便",
+    "方便的",
 }
 
 
@@ -86,7 +96,7 @@ def is_customer_ack(content: str) -> bool:
     # 极短且仅确认语义
     if len(compact) <= 8 and any(
         compact.startswith(p) or compact == p
-        for p in ("收到", "好的", "谢谢", "感谢", "明白", "了解", "嗯")
+        for p in ("收到", "好的", "谢谢", "感谢", "明白", "了解", "嗯", "稍等", "等下")
     ):
         # 含问号/求助则不算确认
         if any(x in raw for x in ("?", "？", "怎么", "如何", "吗", "呢", "失败", "报错", "不行")):
@@ -266,6 +276,86 @@ def is_customer_reaction_only(content: str) -> bool:
     return False
 
 
+_QUESTION_HINTS = (
+    "?",
+    "？",
+    "吗",
+    "呢",
+    "么",
+    "怎么",
+    "如何",
+    "为什么",
+    "为啥",
+    "咋",
+    "能不能",
+    "可不可以",
+    "是否",
+    "有没有",
+    "啥",
+    "帮忙",
+    "麻烦",
+    "失败",
+    "报错",
+    "不行",
+    "无法",
+    "不能",
+    "异常",
+    "登不上",
+    "连不上",
+    "没用",
+    "没有用",
+    "不管用",
+    "没解决",
+    "没好",
+)
+
+
+def customer_own_text(content: str) -> str:
+    """去掉引用块和 @，只留客户自己写的字。"""
+    text = _strip_wecom_quote(content or "")
+    out = []
+    skip = False
+    for ch in text:
+        if ch == "@":
+            skip = True
+            continue
+        if skip:
+            if ch in " \t\n\u2005\u200b\u00a0，。！？,.!?":
+                skip = False
+            else:
+                continue
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def has_question_tone(content: str) -> bool:
+    """客户这句有没有问句或求助语气。没有就不算新问题。"""
+    text = customer_own_text(content)
+    if not text:
+        return False
+    return any(h in text for h in _QUESTION_HINTS)
+
+
+def no_new_question_after_staff(recent: list) -> bool:
+    """同事已经回复过，且之后的客户消息都没有问句语气。"""
+    last_staff_at = 0.0
+    had_staff = False
+    for m in recent:
+        if m.sender_kind == SenderKind.staff:
+            had_staff = True
+            last_staff_at = max(last_staff_at, float(m.sent_at))
+    if not had_staff:
+        return False
+    after = [
+        m
+        for m in recent
+        if m.sender_kind == SenderKind.customer and float(m.sent_at) > last_staff_at
+    ]
+    if not after:
+        return True
+    return not any(has_question_tone(m.content or "") for m in after)
+
+
 def customer_needs_no_followup(content: str) -> bool:
     """确认语、明确完结、或引用同事后的短反应 → 不需要再当待跟进。"""
     return (
@@ -437,20 +527,7 @@ def find_unanswered(
             continue
         if last_staff_after_customer:
             continue
-        # 客户明确表示已解决 / 不用了 → 视为完结
-        if is_customer_issue_closed(last_customer.content):
-            continue
-        # 引用同事答复后只发表情/「好吧」等，没有新问题
-        if is_customer_reaction_only(last_customer.content):
-            continue
-        # 「收到 / 好的 / ok」等确认语：尤其是同事刚发完方案后，不算待跟进
-        if is_customer_ack(last_customer.content) and _staff_before_customer(
-            recent, last_customer.sent_at
-        ):
-            continue
-        # 纯确认且极短，即使前面没抓到 staff，也不告警（避免误报）
-        if is_customer_ack(last_customer.content) and len((last_customer.content or "").strip()) <= 10:
-            continue
+        # 是否还要跟进交给 AI 判断，这里只保留「客户说完还没有同事再回」
 
         waiting = now_ts - float(last_customer.sent_at)
         if waiting < threshold:

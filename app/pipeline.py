@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from .config import Settings
 from .followup_judge import ai_needs_followup
 from .groups import GroupRegistry
-from .models import ScanResult, SenderKind
+from .models import ScanResult, SenderKind, SuggestResult
 from .notify import (
     case_detail_url,
     format_alert_markdown,
@@ -60,31 +60,39 @@ def collect_pending_items(
         room_id = str(meta.get("room_id") or "")
         if not room_id:
             continue
-        last_customer_at = float(meta.get("last_customer_at") or 0)
+        if room_id.startswith("wr_demo_") and (
+            settings is None or (settings.message_source or "").lower() != "demo"
+        ):
+            continue
         recent = annotate_messages(store.recent_messages(room_id, limit=40), registry)
+        # 以还在库里的客户最后一句为准（撤回的消息已删除，不能再用告警里的旧时间）
+        last_cust_text = ""
+        last_customer_at = 0.0
+        for m in reversed(recent):
+            if m.sender_kind == SenderKind.customer:
+                last_cust_text = (m.content or "").strip()
+                last_customer_at = float(m.sent_at)
+                break
+        if not last_cust_text:
+            continue
         staff_replied = any(
             m.sender_kind == SenderKind.staff and float(m.sent_at) > last_customer_at
             for m in recent
         )
         if staff_replied:
             continue
-        # 客户最新一句已明确完结 → 不进未回复表
-        last_cust_text = ""
-        for m in reversed(recent):
-            if m.sender_kind == SenderKind.customer:
-                last_cust_text = (m.content or "").strip()
-                break
-        if last_cust_text and (
-            is_customer_issue_closed(last_cust_text) or is_customer_reaction_only(last_cust_text)
-        ):
-            continue
         waiting = round(max(0.0, (now_ts - last_customer_at) / 60.0), 1) if last_customer_at else None
-        preview = str(meta.get("preview") or "")
-        if not preview and recent:
-            for m in reversed(recent):
-                if m.sender_kind == SenderKind.customer:
-                    preview = (m.content or "").strip()[:100]
-                    break
+        # 摘录以客户最新一句开头，避免表上只看到已经回复过的旧内容
+        preview_parts = []
+        if last_cust_text:
+            preview_parts.append(f"[customer] {last_cust_text}")
+        for m in reversed(recent):
+            if m.sender_kind == SenderKind.staff and float(m.sent_at) < last_customer_at:
+                preview_parts.append(
+                    f"[staff] {m.sender_name or m.sender_id}: {(m.content or '').strip()}"
+                )
+                break
+        preview = " ".join(preview_parts).replace("\n", " ")[:100] or str(meta.get("preview") or "")
         token = _ensure_detail_token(store, key, meta)
         detail_url = case_detail_url(settings, token) if settings else ""
         items.append(
@@ -143,8 +151,10 @@ async def _notify_resolved_alerts(
         if not staff_replied and not customer_closed:
             continue
         group_name = str(meta.get("group_name") or room_id)
-        md = format_resolved_markdown(group_name, room_id)
-        resp = await send_webhook_markdown(webhook, md, safe_mode=settings.safe_mode)
+        resp = None
+        if settings.alert_push_individual:
+            md = format_resolved_markdown(group_name, room_id)
+            resp = await send_webhook_markdown(webhook, md, safe_mode=settings.safe_mode)
         store.mark_alert_resolved_notified(key)
         result.details.append(
             {
@@ -178,9 +188,12 @@ async def push_pending_digest(
     sync_info: Dict[str, Any] = {"ok": True, "skipped": True}
     scan_info: Dict[str, Any] = {"skipped": True}
     if settings.digest_sync_before_send:
+        store.clear_followup_judges()
         sync_info = await asyncio.to_thread(run_sentlink_sync)
         try:
-            scan_result = await run_scan(store, registry, settings, force=True)
+            scan_result = await run_scan(
+                store, registry, settings, force=True, build_suggestion=False
+            )
             scan_info = {
                 "skipped": False,
                 "unanswered": scan_result.unanswered,
@@ -225,11 +238,19 @@ async def push_pending_digest(
     }
 
 
+def _open_alert_for_room(store: MessageStore, room_id: str) -> Dict[str, Any]:
+    for meta in store.list_open_alerts().values():
+        if str(meta.get("room_id") or "") == room_id:
+            return meta
+    return {}
+
+
 async def run_scan(
     store: MessageStore,
     registry: GroupRegistry,
     settings: Settings,
     force: bool = False,
+    build_suggestion: bool = True,
 ) -> ScanResult:
     result = ScanResult()
     if not force and settings.work_hours_enabled:
@@ -251,6 +272,7 @@ async def run_scan(
     changed = False
     wecom_hook = primary_wecom_webhook(settings)
 
+    pending_cases = []
     for case in cases:
         alert_key = f"{case.room_id}:{case.last_customer_msg_id}"
         last = store.get_alert_at(alert_key)
@@ -264,8 +286,33 @@ async def run_scan(
                 }
             )
             continue
+        pending_cases.append(case)
 
-        need, judge_reason = await ai_needs_followup(case, settings)
+    async def _judge(case: Any) -> tuple:
+        key = f"{case.room_id}:{case.last_customer_msg_id}"
+        cached = store.get_followup_judge(key)
+        if cached is not None:
+            return case, bool(cached.get("need")), str(cached.get("reason") or "cached")
+        need, reason = await ai_needs_followup(case, settings)
+        return case, need, reason
+
+    judged: Dict[str, tuple] = {}
+    if pending_cases:
+        sem = asyncio.Semaphore(6)
+
+        async def _limited(case: Any) -> tuple:
+            async with sem:
+                return await _judge(case)
+
+        for case, need, reason in await asyncio.gather(*[_limited(c) for c in pending_cases]):
+            key = f"{case.room_id}:{case.last_customer_msg_id}"
+            if store.get_followup_judge(key) is None:
+                store.set_followup_judge(key, need, reason)
+            judged[key] = (need, reason)
+
+    for case in pending_cases:
+        alert_key = f"{case.room_id}:{case.last_customer_msg_id}"
+        need, judge_reason = judged[alert_key]
         if not need:
             result.skipped_no_followup += 1
             result.details.append(
@@ -277,9 +324,19 @@ async def run_scan(
                 }
             )
             logger.info("skip alert room=%s reason=%s", case.room_id, judge_reason)
+            for key, meta in list(store.list_open_alerts().items()):
+                if str(meta.get("room_id") or "") == case.room_id:
+                    store.mark_alert_resolved_notified(key)
             continue
 
-        suggest = await suggest_reply(case, settings)
+        prev = _open_alert_for_room(store, case.room_id)
+        if build_suggestion:
+            suggest = await suggest_reply(case, settings)
+        else:
+            suggest = SuggestResult(
+                suggestion=str(prev.get("suggestion") or ""),
+                source=str(prev.get("source") or "on_open"),
+            )
         md = format_alert_markdown(
             group_name=case.group_name,
             room_id=case.room_id,
@@ -289,27 +346,33 @@ async def run_scan(
             source=suggest.source,
         )
 
-        # 主通道：企微内部群「自定义消息推送」
-        wecom_resp = await send_webhook_markdown(
-            wecom_hook,
-            md,
-            safe_mode=settings.safe_mode,
-        )
-        generic_resp = await send_generic_webhook(
-            settings.generic_notify_webhook,
-            title=f"客户群待跟进: {case.group_name}",
-            text=md,
-            extra={
-                "group_name": case.group_name,
-                "room_id": case.room_id,
-                "waiting_minutes": case.waiting_minutes,
-                "suggestion": suggest.suggestion,
-                "support_userids": case.support_userids,
-            },
-            safe_mode=settings.safe_mode,
-        )
+        # 默认只推未回复客户表；单条详细告警需显式开启 ALERT_PUSH_INDIVIDUAL
+        wecom_resp = None
+        generic_resp = None
+        if settings.alert_push_individual:
+            wecom_resp = await send_webhook_markdown(
+                wecom_hook,
+                md,
+                safe_mode=settings.safe_mode,
+            )
+            generic_resp = await send_generic_webhook(
+                settings.generic_notify_webhook,
+                title=f"客户群待跟进: {case.group_name}",
+                text=md,
+                extra={
+                    "group_name": case.group_name,
+                    "room_id": case.room_id,
+                    "waiting_minutes": case.waiting_minutes,
+                    "suggestion": suggest.suggestion,
+                    "support_userids": case.support_userids,
+                },
+                safe_mode=settings.safe_mode,
+            )
 
-        detail_token = secrets.token_urlsafe(10)
+        detail_token = str(prev.get("detail_token") or "").strip() or secrets.token_urlsafe(10)
+        for old_key, old_meta in list(store.list_open_alerts().items()):
+            if old_key != alert_key and str(old_meta.get("room_id") or "") == case.room_id:
+                store.mark_alert_resolved_notified(old_key)
         store.set_alert_at(alert_key, now)
         store.set_open_alert(
             alert_key,

@@ -89,6 +89,8 @@ class Settings(BaseSettings):
 
     # 推送未回复客户表前是否先跑 SentLink 同步 + 强制扫描（避免清单滞后）
     digest_sync_before_send: bool = True
+    # 是否推单条详细告警 / 「已跟进」通知；默认 false=企微只收未回复客户表
+    alert_push_individual: bool = False
 
     # 内部 Confluence Wiki（wiki.fit2cloud.cn），Bearer PAT；空 Token=关闭
     confluence_base: str = "https://wiki.fit2cloud.cn"

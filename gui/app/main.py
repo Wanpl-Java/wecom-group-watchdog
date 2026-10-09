@@ -224,6 +224,15 @@ class App(ctk.CTk):
             text_color=CYAN,
             height=36,
         ).pack(side="left", expand=True, fill="x", padx=(6, 0))
+        ctk.CTkButton(
+            int_body,
+            text="发送待跟进表",
+            command=self.do_send_digest,
+            fg_color=CYAN,
+            hover_color="#67e8f9",
+            text_color="#041018",
+            height=36,
+        ).pack(fill="x", pady=(8, 0))
 
         self.gui_auto = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(
@@ -479,6 +488,37 @@ class App(ctk.CTk):
                 self.after(0, lambda: self._set_log("scan 完成"))
             except Exception as e:  # noqa: BLE001
                 self.after(0, lambda: messagebox.showerror("扫描失败", str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def do_send_digest(self) -> None:
+        if not messagebox.askyesno(
+            "发送待跟进表",
+            "将先同步群消息并重新扫描，再把未回复客户表发到企微。\n确认继续？",
+        ):
+            return
+        self._sync_client()
+        self._set_log("正在同步并发送待跟进表…")
+
+        def work() -> None:
+            try:
+                data = self.client.push_pending_digest()
+                names = [
+                    str(it.get("group_name") or "")
+                    for it in (data.get("items") or [])
+                ]
+                lines = [
+                    f"已发送 · {data.get('count', 0)} 条",
+                    f"同步: {data.get('sync')}",
+                    f"企微: {data.get('wecom_resp')}",
+                ]
+                if names:
+                    lines.append("\n".join(f"{i}. {n}" for i, n in enumerate(names, 1)))
+                text = "\n".join(lines)
+                self.after(0, lambda: self._append("--- 待跟进表 ---\n" + text + "\n"))
+                self.after(0, lambda: self._set_log("待跟进表已发送"))
+            except Exception as e:  # noqa: BLE001
+                self.after(0, lambda: messagebox.showerror("发送失败", str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 

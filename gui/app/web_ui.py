@@ -358,6 +358,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="btns">
           <button type="button" onclick="setIntervalMin()">应用到服务端</button>
           <button class="ghost" type="button" onclick="scan()">立即扫描</button>
+          <button type="button" onclick="sendDigest()">发送待跟进表</button>
         </div>
       </section>
 
@@ -453,6 +454,15 @@ async function scan(){
   document.getElementById('out').textContent = JSON.stringify(d, null, 2);
   setStatus(d.error ? `scan 失败: ${d.error}` : 'scan 完成');
 }
+async function sendDigest(){
+  if(!confirm('将先同步群消息并重新扫描，再把未回复客户表发到企微。确认？')) return;
+  setStatus('同步并发送待跟进表…');
+  const r = await fetch('/api/pending-digest', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({base_url: base()})});
+  const d = await r.json();
+  document.getElementById('out').textContent = JSON.stringify(d, null, 2);
+  setStatus(d.error ? `发送失败: ${d.error}` : `已发送 ${d.count||0} 条`);
+}
 async function suggest(){
   const q = document.getElementById('q').value.trim();
   if(!q){ alert('请先填写模拟问题'); return; }
@@ -514,6 +524,14 @@ def api_interval(body: IntervalBody) -> Dict[str, Any]:
 def api_scan(body: ScanBody) -> Dict[str, Any]:
     try:
         return WatchdogClient(body.base_url).force_scan()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/pending-digest")
+def api_pending_digest(body: ScanBody) -> Dict[str, Any]:
+    try:
+        return WatchdogClient(body.base_url).push_pending_digest()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
 

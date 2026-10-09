@@ -38,6 +38,16 @@ class WatchdogClient:
             r.raise_for_status()
             return r.json()
 
+    def push_pending_digest(self) -> Dict[str, Any]:
+        """先同步群消息再扫描，然后把未回复客户表推到企微。"""
+        with httpx.Client(timeout=max(self.timeout, 600.0)) as c:
+            r = c.post(
+                f"{self.base_url}/admin/pending-digest",
+                params={"force": "true"},
+            )
+            r.raise_for_status()
+            return r.json()
+
     def suggest(
         self,
         question: str,
