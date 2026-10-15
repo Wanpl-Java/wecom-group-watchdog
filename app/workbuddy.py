@@ -14,7 +14,7 @@ from .anti_aistyle import light_deai_customer_reply, load_anti_aistyle_block
 from .config import Settings
 from .confluence_kb import format_confluence_hint, search_confluence
 from .kb import format_kb_hint, match_kb_articles
-from .models import SuggestResult, UnansweredCase
+from .models import SenderKind, SuggestResult, UnansweredCase
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,9 @@ _SYSTEM_OUTPUT_RULES = (
     "回复规划按题型：机制咨询只答逻辑；故障才要版本/截图/向日葵；有高匹配KB则文档名+URL嵌进同一段。"
     "咨询答完即止；故障才补「把版本和截图发我就行」一类收束；禁止客服套话收尾。"
     "量体裁衣：第3/4段都要紧扣客户原问，问什么答什么，不要凑篇幅。"
+    "多轮记录里只处理「当前未回复问题」（同事最后一次回复之后、客户新发的那一轮）。"
+    "更早且同事已经回复过的话题视为已结束，禁止再分析、禁止写进第2/3/4段，也不要在回复里重答旧问题。"
+    "第3/4段要给出针对这一轮问题的具体处理办法，不要把几个历史问题揉在一起。"
     "纯机制/原理咨询（如调用账号逻辑是什么）：第4段只讲清逻辑即可收束；"
     "禁止追问版本号、截图、复现步骤、是否报错、是否选错账号等补充说明。"
     "仅当客户明确报错/连不上/失败/异常时，第4段才可顺带要版本/报错/复现，并对照问题给排查方向。"
@@ -61,20 +64,42 @@ def _finalize_suggestion(text: str, customer_excerpt: str = "") -> str:
     return light_deai_customer_reply((text or "").strip(), customer_excerpt=customer_excerpt)
 
 
+def latest_unanswered_text(case: UnansweredCase) -> str:
+    """同事最后一次回复之后，客户新发的内容。这才是要回答的问题。"""
+    recent = list(case.recent_messages or [])
+    last_staff = -1
+    for i, msg in enumerate(recent):
+        if msg.sender_kind == SenderKind.staff:
+            last_staff = i
+    pending = []
+    for msg in recent[last_staff + 1 :]:
+        if msg.sender_kind == SenderKind.customer:
+            text = (msg.content or "").strip()
+            if text:
+                pending.append(text)
+    if pending:
+        return "\n".join(pending)
+    return (case.customer_excerpt or "").strip()
+
+
 def _build_prompt(
     case: UnansweredCase,
     hint: str,
     extra: str = "",
     settings: Optional[Settings] = None,
 ) -> str:
-    kb_block = format_kb_hint(case.customer_excerpt or "")
-    wiki_block = format_confluence_hint(case.customer_excerpt or "", settings)
+    current = latest_unanswered_text(case)
+    kb_block = format_kb_hint(current)
+    wiki_block = format_confluence_hint(current, settings)
     body = (
         f"{hint}\n\n"
         f"客户群: {case.group_name}\n"
         f"产品线: {case.product or '未知'}\n"
         f"已等待: {case.waiting_minutes} 分钟\n"
-        f"最近对话:\n{case.customer_excerpt}\n"
+        "只分析并解决下面这一条当前未回复问题，给出具体处理办法。"
+        "更早对话里同事已经回复过的话题不要再写。\n"
+        f"当前未回复问题:\n{current}\n"
+        f"\n较早对话（仅背景，禁止重答）:\n{case.customer_excerpt}\n"
         f"\n{kb_block}\n"
     )
     if wiki_block:
@@ -410,32 +435,47 @@ def collect_workspace_snippets(workspace: str, excerpt: str, max_chars: int = 45
 
 
 def _discover_desktop_gateway_url() -> str:
-    """从本机 WorkBuddy 进程命令行解析 codebuddy --serve --port。"""
+    """从本机 WorkBuddy / CodeBuddy 进程命令行解析 codebuddy --serve --port。"""
+    import platform
     import re
     import subprocess
 
+    lines: list[str] = []
     try:
-        # Windows: 枚举命令行含 codebuddy --serve 的进程
-        completed = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                (
-                    "Get-CimInstance Win32_Process -Filter \"Name='WorkBuddy.exe'\" | "
-                    "ForEach-Object { $_.CommandLine }"
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        if platform.system().lower().startswith("win"):
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "Get-CimInstance Win32_Process | "
+                        "Where-Object { $_.CommandLine -and "
+                        "($_.CommandLine -match 'codebuddy' -or $_.Name -eq 'WorkBuddy.exe') } | "
+                        "ForEach-Object { $_.CommandLine }"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            lines = (completed.stdout or "").splitlines()
+        else:
+            # Linux / macOS: CodeBuddy CLI `codebuddy --serve --port N`
+            completed = subprocess.run(
+                ["ps", "-ww", "-eo", "args"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            lines = (completed.stdout or "").splitlines()
     except Exception:  # noqa: BLE001
-        logger.exception("discover WorkBuddy desktop gateway failed")
+        logger.exception("discover CodeBuddy/WorkBuddy gateway failed")
         return ""
 
-    for line in (completed.stdout or "").splitlines():
-        if "codebuddy" not in line or "--serve" not in line:
+    for line in lines:
+        low = line.lower()
+        if "codebuddy" not in low or "--serve" not in low:
             continue
         m = re.search(r"--port\s+(\d+)", line)
         if m:
@@ -475,7 +515,7 @@ async def _via_desktop_gateway(case: UnansweredCase, settings: Settings) -> Sugg
     snippets = ""
     if workspace:
         snippets = await asyncio.to_thread(
-            collect_workspace_snippets, workspace, case.customer_excerpt
+            collect_workspace_snippets, workspace, latest_unanswered_text(case)
         )
         logger.info("workspace snippets chars=%s root=%s", len(snippets), workspace)
 
@@ -548,7 +588,7 @@ async def _via_ai_gateway(case: UnansweredCase, settings: Settings) -> SuggestRe
     snippets = ""
     if workspace:
         snippets = await asyncio.to_thread(
-            collect_workspace_snippets, workspace, case.customer_excerpt
+            collect_workspace_snippets, workspace, latest_unanswered_text(case)
         )
         logger.info("ai_gateway workspace snippets chars=%s root=%s", len(snippets), workspace)
 
