@@ -14,7 +14,7 @@ _BRIDGE = _ROOT / "scripts" / "bridge_sentlink.py"
 
 
 def run_sentlink_sync() -> Dict[str, Any]:
-    """执行一次 bridge_sentlink.sync_once，返回 inserted 等摘要。"""
+    """执行一次 bridge catchup 同步（TTL + 待跟进 + 会话更新），返回摘要。"""
     if not _BRIDGE.is_file():
         return {"ok": False, "error": f"bridge missing: {_BRIDGE}"}
     try:
@@ -25,9 +25,21 @@ def run_sentlink_sync() -> Dict[str, Any]:
             return {"ok": False, "error": "cannot load bridge_sentlink"}
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        inserted = int(mod.sync_once(full_today=True) or 0)
+        # 发 digest 前用 catchup：后台常驻已保温，这里只补漏，避免全量 100+ 群
+        result = mod.sync_once(mode="catchup")
+        if isinstance(result, dict):
+            logger.info(
+                "pre-send SentLink sync mode=%s inserted=%s fetched=%s/%s skipped=%s",
+                result.get("mode"),
+                result.get("inserted"),
+                result.get("fetched_ok"),
+                result.get("fetched_rooms"),
+                result.get("skipped_quiet"),
+            )
+            return {"ok": bool(result.get("ok", True)), **result}
+        inserted = int(result or 0)
         logger.info("pre-send SentLink sync inserted=%s", inserted)
-        return {"ok": True, "inserted": inserted}
+        return {"ok": True, "inserted": inserted, "mode": "catchup"}
     except SystemExit as exc:
         msg = str(exc) or "bridge SystemExit"
         logger.error("pre-send SentLink sync aborted: %s", msg)

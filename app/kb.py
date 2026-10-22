@@ -13,9 +13,10 @@ KB_BASE = "https://kb.fit2cloud.com"
 KB_CATEGORY = f"{KB_BASE}/categories/jumpserver"
 _JS_CATEGORY_NAME = "2"
 _CACHE_TTL_SEC = 3600
-_MIN_SCORE = 12
+_MIN_SCORE = 14
 _MIN_STRONG_HITS = 1
 
+# 过宽词：单独出现不得撑起「高度匹配」（典型：仅 Windows → 误中 AD 域文档）
 _WEAK_TERMS = {
     "jumpserver",
     "jump",
@@ -39,7 +40,46 @@ _WEAK_TERMS = {
     "用户",
     "登陆",
     "登录",
+    "windows",
+    "window",
+    "win",
+    "win10",
+    "win11",
+    "linux",
+    "macos",
+    "mac",
+    "microsoft",
+    "centos",
+    "ubuntu",
+    "debian",
+    "redhat",
+    "对接",
+    "机器",
+    "主机",
+    "系统",
+    "数据",
+    "老师",
+    "帮忙",
+    "看下",
+    "飞致云",
 }
+
+# 短缩写但语义强：可单独构成高度匹配（须同时过主题闸门）
+_STRONG_ACRONYMS = {
+    "ad",
+    "mfa",
+    "ssl",
+    "sso",
+    "cas",
+    "otp",
+    "rdp",
+    "vnc",
+    "ssh",
+    "ldap",
+    "oidc",
+    "saml",
+}
+
 
 _cache_arts: List[Tuple[str, str]] = []
 _cache_at: float = 0.0
@@ -51,9 +91,11 @@ def _normalize(s: str) -> str:
 
 def _is_strong_term(term: str) -> bool:
     nt = _normalize(term)
-    if len(nt) < 3:
-        return False
     if nt in _WEAK_TERMS:
+        return False
+    if nt in _STRONG_ACRONYMS:
+        return True
+    if len(nt) < 3:
         return False
     # 「远程应」「程应用」等弱词切窗不算强
     for w in _WEAK_TERMS:
@@ -108,6 +150,12 @@ def _extract_query_terms(text: str) -> List[str]:
         "乱码",
         "LDAP",
         "MFA",
+        "AD域",
+        "Windows AD",
+        "域控",
+        "域账号",
+        "域用户",
+        "加入域",
         "PyCharm",
         "Oracle",
         "WinRM",
@@ -149,8 +197,10 @@ def _score_title(title: str, terms: List[str]) -> Tuple[int, int, List[str]]:
         if len(nt_term) < 2 or nt_term not in nt:
             continue
         if _is_strong_term(term):
-            if re.fullmatch(r"[a-z0-9][a-z0-9._-]{2,}", nt_term):
+            if nt_term in _STRONG_ACRONYMS:
                 score += 16
+            elif re.fullmatch(r"[a-z0-9][a-z0-9._-]{2,}", nt_term):
+                score += 16 if len(nt_term) >= 4 else 8
             else:
                 score += max(5, min(12, len(term) + 2))
             strong_hits += 1
@@ -159,6 +209,49 @@ def _score_title(title: str, terms: List[str]) -> Tuple[int, int, List[str]]:
             weak_bonus += 1
     score += min(2, weak_bonus)
     return score, strong_hits, matched_strong
+
+
+def _title_has_ad_topic(title: str) -> bool:
+    t = title or ""
+    nt = _normalize(t)
+    # 「免域」是 RemoteApp 无域场景，不算 AD/域对接主题
+    if "免域" in t:
+        return False
+    if "ldap" in nt or "activedirectory" in nt:
+        return True
+    if re.search(r"(?i)\bAD\b", t) or "windowsad" in nt or "对接windowsad" in nt:
+        return True
+    if "域" in t and any(x in t for x in ("AD", "ad", "域控", "域认", "域账")):
+        return True
+    # 「…AD 域配置…」：有 AD + 域
+    if "域" in t and ("ad" in nt):
+        return True
+    return False
+
+
+def _query_has_ad_topic(raw_text: str = "") -> bool:
+    raw = raw_text or ""
+    q = _normalize(raw)
+    if any(
+        x in q
+        for x in (
+            "ldap",
+            "activedirectory",
+            "ad域",
+            "域控",
+            "域账号",
+            "域用户",
+            "域认证",
+            "加入域",
+            "windowsad",
+        )
+    ):
+        return True
+    if re.search(r"(?i)\bAD\b", raw):
+        return True
+    if "域" in raw and any(k in raw for k in ("域控", "域账", "域用", "加入域", "LDAP", "ldap")):
+        return True
+    return False
 
 
 def _fetch_jumpserver_articles(timeout: float = 20.0) -> List[Tuple[str, str]]:
@@ -228,10 +321,20 @@ def search_kb_online(text: str, limit: int = 2) -> List[Tuple[str, str, int]]:
     if not arts:
         return []
     ranked: List[Tuple[int, str, str]] = []
+    query_ad = _query_has_ad_topic(text)
     for title, url in arts:
         sc, strong, _matched = _score_title(title, terms)
-        if sc >= _MIN_SCORE and strong >= _MIN_STRONG_HITS:
-            ranked.append((sc, title, url))
+        title_ad = _title_has_ad_topic(title)
+        # AD/域类标题：查询必须也有 AD/域/LDAP 语境，禁止仅 Windows 命中
+        if title_ad and not query_ad:
+            continue
+        # 双方都是 AD/域语境时给主题加分（如「域控」对「AD 域配置」）
+        if title_ad and query_ad:
+            sc = max(sc + 10, _MIN_SCORE)
+            strong = max(strong, 1)
+        if sc < _MIN_SCORE or strong < _MIN_STRONG_HITS:
+            continue
+        ranked.append((sc, title, url))
     ranked.sort(key=lambda x: (-x[0], x[1]))
     out: List[Tuple[str, str, int]] = []
     seen = set()

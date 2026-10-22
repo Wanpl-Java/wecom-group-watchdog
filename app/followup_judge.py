@@ -51,10 +51,36 @@ _NO_FOLLOWUP_EXACT = {
 
 def _is_plain_ack_or_mention(text: str) -> bool:
     """同事已回复后，客户只剩 @、稍等、好的、0 这类，等再久也不算待跟进。"""
-    from .scanner import _strip_punct, customer_own_text
+    from .scanner import (
+        _strip_punct,
+        customer_needs_no_followup,
+        customer_own_text,
+        has_question_tone,
+    )
 
+    if customer_needs_no_followup(text):
+        return True
     own = _strip_punct(customer_own_text(text)).lower()
-    return own in _NO_FOLLOWUP_EXACT
+    if own in _NO_FOLLOWUP_EXACT:
+        return True
+    # 「好的，谢谢」「收到谢谢」这类短确认
+    if len(own) <= 8 and own.startswith(("好的", "收到", "谢谢", "稍等", "可以")):
+        return True
+    # 无问句/求助，且明确「无需再确认」类收尾
+    if not has_question_tone(text) and any(
+        p in own
+        for p in (
+            "无需再确认",
+            "不用再确认",
+            "不需要再确认",
+            "无需确认",
+            "不用确认",
+            "知道即可",
+            "知道就行",
+        )
+    ):
+        return True
+    return False
 
 
 def _last_customer_text(case: UnansweredCase) -> str:
@@ -89,18 +115,18 @@ async def ai_needs_followup(case: UnansweredCase, settings: Settings) -> Tuple[b
     告警前二次判定。返回 (需要跟进, 原因)。
     AI 不可用或解析失败时默认 True（保持原超时告警行为）。
     """
-    if not getattr(settings, "followup_ai_judge", True):
-        return True, "judge_disabled"
-
-    mode = (settings.workbuddy_mode or "").lower().strip()
-    base = (settings.ai_gateway_base_url or "").rstrip("/")
-    key = (settings.ai_gateway_api_key or "").strip()
-    if mode not in ("ai_gateway", "openai") or not base or not key:
-        return True, "ai_unavailable_default_alert"
-
     last = _last_customer_text(case)
     if _is_plain_ack_or_mention(last):
         return False, "local_ack_or_mention"
+
+    if not getattr(settings, "followup_ai_judge", True):
+        return True, "judge_disabled"
+
+    base = (settings.ai_gateway_base_url or "").rstrip("/")
+    key = (settings.ai_gateway_api_key or "").strip()
+    # 跟进判断始终走网关；建议话术才看 WORKBUDDY_MODE
+    if not base or not key:
+        return True, "ai_unavailable_default_alert"
     excerpt = (case.customer_excerpt or "")[-1200:]
     user = (
         f"群：{case.group_name}\n"

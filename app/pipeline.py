@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .config import Settings
-from .followup_judge import ai_needs_followup
+from .followup_judge import _is_plain_ack_or_mention, ai_needs_followup
 from .groups import GroupRegistry
 from .models import ScanResult, SenderKind, SuggestResult
 from .notify import (
@@ -75,6 +75,8 @@ def collect_pending_items(
                 break
         if not last_cust_text:
             continue
+        # 是否跟进已在 scan 时由 AI 判定并写入 open_alerts；这里只做事实校验：
+        # 库里若已有同事在客户之后回复，则不再进表（不做二次本地语义评判）。
         staff_replied = any(
             m.sender_kind == SenderKind.staff and float(m.sent_at) > last_customer_at
             for m in recent
@@ -180,10 +182,12 @@ async def push_pending_digest(
     settings: Settings,
     *,
     force: bool = False,
+    webhook_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """推送未回复客户表（带详情超链接）到企微群消息推送。
 
     默认先 SentLink 同步再强制扫描，避免消息滞后导致误报/漏报。
+    webhook_url 非空时覆盖 .env 中的 WECOM_NOTIFY_WEBHOOK（仅本次请求）。
     """
     sync_info: Dict[str, Any] = {"ok": True, "skipped": True}
     scan_info: Dict[str, Any] = {"skipped": True}
@@ -204,7 +208,7 @@ async def push_pending_digest(
             scan_info = {"skipped": False, "error": str(exc)}
 
     items = collect_pending_items(store, registry, settings=settings)
-    webhook = primary_wecom_webhook(settings)
+    webhook = (webhook_url or "").strip() or primary_wecom_webhook(settings)
     if not webhook:
         return {
             "ok": False,
@@ -226,12 +230,18 @@ async def push_pending_digest(
         }
     md = format_pending_list_markdown(items)
     resp = await send_webhook_markdown(webhook, md, safe_mode=settings.safe_mode)
+    # 回传时脱敏 key，避免日志/GUI 整段泄露
+    masked = webhook
+    if "key=" in masked:
+        head, _, tail = masked.partition("key=")
+        masked = head + "key=" + (tail[:4] + "***" if tail else "***")
     return {
         "ok": True,
         "count": len(items),
         "items": items,
         "wecom_resp": resp,
         "safe_mode": settings.safe_mode,
+        "webhook": masked,
         "public_base_url": case_detail_url(settings, "TOKEN").rsplit("/", 1)[0] + "/",
         "sync": sync_info,
         "scan": scan_info,

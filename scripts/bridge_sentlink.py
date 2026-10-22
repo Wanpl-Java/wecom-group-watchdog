@@ -18,6 +18,9 @@
   WATCHDOG_INGEST_URL=http://127.0.0.1:8092/ingest/messages
   WATCHDOG_INGEST_TOKEN=                   # 若 watchdog 配了 INGEST_TOKEN
   BRIDGE_STATE_FILE=./data/sentlink_bridge_state.json
+  BRIDGE_CATCHUP_TTL_SECONDS=300           # catchup：超过该秒未拉过的群强制刷新
+  BRIDGE_CATCHUP_MSG_PAGE_SIZE=12          # catchup 每群拉最近 N 条（跟进判定够用）
+  BRIDGE_WORKERS=3
 """
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib import error, parse, request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,14 +76,25 @@ def api_get(base: str, path: str, api_key: str, params: Dict[str, Any], tenant_i
     }
     if tenant_id:
         headers["X-Tenant-ID"] = tenant_id
-    req = request.Request(url, headers=headers, method="GET")
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            body = resp.read().decode("utf-8")
-            data = json.loads(body)
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"HTTP {exc.code} {path}: {detail}") from exc
+    retries = max(1, int(env("BRIDGE_API_RETRIES", "4") or "4"))
+    last_exc: Optional[BaseException] = None
+    for attempt in range(retries):
+        req = request.Request(url, headers=headers, method="GET")
+        try:
+            with request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode("utf-8")
+                data = json.loads(body)
+            break
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"HTTP {exc.code} {path}: {detail}") from exc
+        except Exception as exc:  # noqa: BLE001 — 中继抖动 / SSL EOF
+            last_exc = exc
+            if attempt + 1 >= retries:
+                raise
+            time.sleep(0.4 * (attempt + 1))
+    else:
+        raise RuntimeError(f"api_get failed: {last_exc}")
     if not isinstance(data, dict):
         raise RuntimeError(f"unexpected response: {data!r}")
     if data.get("code") not in (0, "0", None):
@@ -207,28 +221,37 @@ def match_watch_product(name: str, watch_product: str) -> bool:
     return any(one(p) for p in parts)
 
 
-def _today_start_ms() -> int:
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
+def sync_once(full_today: bool = False, mode: str = "") -> Dict[str, Any]:
+    """拉取 SentLink 群消息并 ingest。
 
-    start = datetime.now(ZoneInfo("Asia/Shanghai")).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return int(start.timestamp() * 1000)
+    mode:
+      - incremental: 会话时间有更新 / 待跟进群
+      - catchup: 增量 + TTL 强制刷新（推荐后台与发 digest 前）
+      - full: 全部监控群（慢，仅排障）
+    full_today=True 等价 mode=full（兼容旧调用）。
+    """
+    mode_l = (mode or "").strip().lower()
+    if not mode_l:
+        mode_l = "full" if full_today else "incremental"
+    if mode_l not in ("incremental", "catchup", "full"):
+        mode_l = "catchup"
 
-
-def sync_once(full_today: bool = False) -> int:
     base = env("SENTLINK_BASE_URL", "https://csm.fit2cloud.cn")
     api_key = env("SENTLINK_API_KEY")
     staff = env("SENTLINK_EXT_STAFF_ID", "WanPeiLin")
     session_type = env("SENTLINK_SESSION_TYPE", "room")
     watch_product = env("WATCH_PRODUCT", "js")
     page_size = int(env("SENTLINK_PAGE_SIZE", "30") or "30")
-    msg_page = int(env("SENTLINK_MSG_PAGE_SIZE", "40") or "40")
+    if mode_l == "catchup":
+        msg_page = int(env("BRIDGE_CATCHUP_MSG_PAGE_SIZE", "12") or "12")
+    else:
+        msg_page = int(env("SENTLINK_MSG_PAGE_SIZE", "40") or "40")
     tenant = env("SENTLINK_TENANT_ID")
     ingest_url = env("WATCHDOG_INGEST_URL", "http://127.0.0.1:8092/ingest/messages")
     ingest_token = env("WATCHDOG_INGEST_TOKEN")
     state_path = Path(env("BRIDGE_STATE_FILE", str(ROOT / "data" / "sentlink_bridge_state.json")))
+    ttl_sec = float(env("BRIDGE_CATCHUP_TTL_SECONDS", "300") or "300")
+    now_ts = time.time()
 
     if not api_key:
         raise SystemExit("SENTLINK_API_KEY missing")
@@ -279,15 +302,17 @@ def sync_once(full_today: bool = False) -> int:
     print(
         f"[bridge] sessions={len(items)} rooms={len(by_room)} "
         f"watched={len(room_list)} product={watch_product} staff={staff} type={session_type}"
+        f" mode={mode_l}"
     )
 
     batch: List[Dict[str, Any]] = []
     max_msgtime = last_msgtime
     room_cursor = dict(state.get("room_msgtime") or {})
+    room_pulled_at = {str(k): float(v) for k, v in (state.get("room_last_pulled_at") or {}).items()}
     pending_rooms = _pending_room_ids(state_path)
-    today_ms = _today_start_ms() if full_today else 0
     skipped_quiet = 0
     to_fetch: List[Dict[str, Any]] = []
+    fetch_reasons: Dict[str, str] = {}
 
     for sess in room_list:
         room_id = sess.get("roomid") or ""
@@ -295,15 +320,30 @@ def sync_once(full_today: bool = False) -> int:
             continue
         sess_mt = int(sess.get("msgtime") or 0)
         prev_mt = int(room_cursor.get(room_id) or 0)
-        # 发送前：今天有过消息的群全部重拉，不看本地游标
-        if full_today and sess_mt >= today_ms:
+        last_pull = float(room_pulled_at.get(room_id) or 0)
+
+        if mode_l == "full":
             to_fetch.append(sess)
+            fetch_reasons[room_id] = "full"
             continue
-        # 会话时间没变、且不在待跟进里：跳过拉消息，避免每次全量打 100+ 个群
-        if prev_mt and sess_mt and sess_mt <= prev_mt and room_id not in pending_rooms:
-            skipped_quiet += 1
+
+        # 会话时间有更新
+        if sess_mt and (not prev_mt or sess_mt > prev_mt):
+            to_fetch.append(sess)
+            fetch_reasons[room_id] = "session_newer"
             continue
-        to_fetch.append(sess)
+        # 待跟进群强制拉（会话时间可能滞后）
+        if room_id in pending_rooms:
+            to_fetch.append(sess)
+            fetch_reasons[room_id] = "pending"
+            continue
+        # catchup：超过 TTL 未拉过 → 强制刷新，弥补会话时间不可靠
+        if mode_l == "catchup":
+            if not last_pull or (now_ts - last_pull) >= ttl_sec:
+                to_fetch.append(sess)
+                fetch_reasons[room_id] = "ttl"
+                continue
+        skipped_quiet += 1
 
     def _pull_room(sess: Dict[str, Any]) -> List[Dict[str, Any]]:
         room_id = sess.get("roomid") or ""
@@ -330,10 +370,29 @@ def sync_once(full_today: bool = False) -> int:
         return out
 
     pulled: List[List[Dict[str, Any]]] = []
+    room_errors = 0
+    ok_room_ids: List[str] = []
     if to_fetch:
-        workers = min(8, len(to_fetch))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            pulled = list(pool.map(_pull_room, to_fetch))
+        default_workers = "2" if mode_l == "full" else "3"
+        workers = min(int(env("BRIDGE_WORKERS", default_workers) or default_workers), len(to_fetch))
+
+        def _safe_pull(sess: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[BaseException], str]:
+            rid = str(sess.get("roomid") or "")
+            try:
+                return (_pull_room(sess), None, rid)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[bridge] room_fail {sess.get('group_chat_name') or rid}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                return ([], exc, rid)
+
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            raw = list(pool.map(_safe_pull, to_fetch))
+        pulled = [msgs for msgs, _err, _rid in raw]
+        room_errors = sum(1 for _msgs, err, _rid in raw if err is not None)
+        ok_room_ids = [rid for _msgs, err, rid in raw if err is None and rid]
 
     if last_msgtime == 0:
         window_h = float(env("BRIDGE_BOOTSTRAP_HOURS", "6") or "6")
@@ -357,14 +416,43 @@ def sync_once(full_today: bool = False) -> int:
         if sess_mt:
             room_cursor[room_id] = max(prev_mt, sess_mt)
 
-    print(f"[bridge] skipped_quiet={skipped_quiet} fetched={len(to_fetch)}")
+    # 成功拉过的群更新 TTL 时钟（失败的下次还会进 catchup）
+    for rid in ok_room_ids:
+        room_pulled_at[rid] = now_ts
+
+    reason_counts: Dict[str, int] = {}
+    for rid in fetch_reasons:
+        r = fetch_reasons[rid]
+        reason_counts[r] = reason_counts.get(r, 0) + 1
+
+    fetched_ok = len(to_fetch) - room_errors
+    print(
+        f"[bridge] skipped_quiet={skipped_quiet} fetched={len(to_fetch)} "
+        f"ok={fetched_ok} fail={room_errors} reasons={reason_counts}"
+    )
     state["room_msgtime"] = room_cursor
+    state["room_last_pulled_at"] = room_pulled_at
+    summary: Dict[str, Any] = {
+        "ok": room_errors == 0 or fetched_ok > 0,
+        "inserted": 0,
+        "fetched_rooms": len(to_fetch),
+        "fetched_ok": fetched_ok,
+        "fetched_fail": room_errors,
+        "skipped_quiet": skipped_quiet,
+        "watched": len(room_list),
+        "mode": mode_l,
+        "full_today": mode_l == "full",
+        "ttl_seconds": ttl_sec if mode_l == "catchup" else None,
+        "reasons": reason_counts,
+    }
     if not batch:
         print("[bridge] no new messages")
         state["seen_msg_ids"] = list(seen)
         state["last_msgtime"] = max_msgtime or last_msgtime
         save_state(state_path, state)
-        return 0
+        if room_errors and fetched_ok == 0:
+            raise RuntimeError(f"all {room_errors} room pulls failed")
+        return summary
 
     # ingest 按时间正序更利于判定
     batch.sort(key=lambda x: x["sent_at"])
@@ -375,8 +463,13 @@ def sync_once(full_today: bool = False) -> int:
     state["seen_msg_ids"] = list(seen)
     state["last_msgtime"] = max_msgtime or last_msgtime
     state["room_msgtime"] = room_cursor
+    state["room_last_pulled_at"] = room_pulled_at
     save_state(state_path, state)
-    return len(batch)
+    summary["inserted"] = len(batch)
+    summary["ingest"] = result
+    if room_errors and fetched_ok == 0:
+        raise RuntimeError(f"all {room_errors} room pulls failed")
+    return summary
 
 
 def _pending_room_ids(state_path: Path) -> set:
@@ -398,17 +491,26 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", default=True, help="run one sync (default)")
     parser.add_argument("--loop", action="store_true", help="loop forever")
     parser.add_argument("--interval", type=int, default=60, help="loop interval seconds")
+    parser.add_argument(
+        "--mode",
+        default="catchup",
+        choices=("incremental", "catchup", "full"),
+        help="sync strategy (default catchup)",
+    )
     args = parser.parse_args()
+    interval = int(env("BRIDGE_INTERVAL", str(args.interval)) or args.interval)
 
     if args.loop:
         while True:
             try:
-                sync_once()
+                sync_once(mode=args.mode)
             except Exception as exc:  # noqa: BLE001
-                print(f"[bridge] error: {exc}")
-            time.sleep(max(10, args.interval))
+                print(f"[bridge] error: {exc}", flush=True)
+                time.sleep(min(30, max(10, interval)))
+                continue
+            time.sleep(max(10, interval))
     else:
-        sync_once()
+        sync_once(mode=args.mode)
     return 0
 
 

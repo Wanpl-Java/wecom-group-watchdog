@@ -291,15 +291,29 @@ async def admin_pending(
 
 @app.post("/admin/pending-digest")
 async def admin_pending_digest(
+    request: Request,
     force: bool = Query(True, description="空清单也推送一张「当前无待跟进」"),
     settings: Settings = Depends(get_settings),
     store: MessageStore = Depends(get_store),
     registry: GroupRegistry = Depends(get_registry),
 ) -> Dict[str, Any]:
-    """手动把未回复客户表推到企微（带详情超链接）。"""
+    """手动把未回复客户表推到企微（带详情超链接）。
+
+    可选 JSON body：{"webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."}
+    有 webhook_url 时仅本次覆盖 .env 配置。
+    """
     from .pipeline import push_pending_digest
 
-    return await push_pending_digest(store, registry, settings, force=force)
+    webhook_url = ""
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = None
+    if isinstance(payload, dict):
+        webhook_url = str(payload.get("webhook_url") or payload.get("webhook") or "").strip()
+    return await push_pending_digest(
+        store, registry, settings, force=force, webhook_url=webhook_url or None
+    )
 
 
 def _render_case_html(
@@ -495,6 +509,9 @@ async def case_detail(
     excerpt = str(meta.get("excerpt") or meta.get("preview") or "")
     suggestion = str(meta.get("suggestion") or "").strip()
     source = str(meta.get("source") or "stored")
+    # 只针对最近一条未回复问题生成。旧建议若按整段历史写的，打开时重算一次。
+    if str(meta.get("suggest_focus") or "") != "latest-q-v1":
+        suggestion = ""
 
     # 旧告警未落库完整建议时，打开链接再生成一次并写回
     if not suggestion:
@@ -530,6 +547,7 @@ async def case_detail(
                     "excerpt": excerpt,
                     "suggestion": suggestion,
                     "source": source,
+                    "suggest_focus": "latest-q-v1",
                     "preview": (excerpt or "")[:100],
                 },
             )
