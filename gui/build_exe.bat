@@ -13,17 +13,20 @@ if exist "%LocalAppData%\Programs\Python\Python313\tcl\tcl8.6\init.tcl" (
 
 if not exist .venv\Scripts\python.exe (
   python -m venv .venv
-  .venv\Scripts\pip install -r requirements.txt
+  if errorlevel 1 exit /b 1
 )
 
-echo [info] installing pyinstaller ...
-.venv\Scripts\pip install -q "pyinstaller>=6.0"
+echo [info] installing GUI dependencies and pyinstaller ...
+.venv\Scripts\python.exe -m pip install -q -r requirements.txt "pyinstaller>=6.0"
+if errorlevel 1 exit /b 1
 
 echo [info] building WatchdogConsole.exe (onedir, windowed) ...
 .venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed ^
   --name WatchdogConsole ^
   --paths app ^
   --collect-all customtkinter ^
+  --add-data "app\assets;assets" ^
+  --icon "app\assets\watchdog.ico" ^
   --hidden-import client ^
   --hidden-import customtkinter ^
   watchdog_console.py
@@ -36,4 +39,4 @@ if errorlevel 1 (
 echo.
 echo [ok] output: %cd%\dist\WatchdogConsole\WatchdogConsole.exe
 echo      double-click that exe; Watchdog service must be running on 127.0.0.1:8092
-explorer "%cd%\dist\WatchdogConsole"
+exit /b 0
